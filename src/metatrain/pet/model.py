@@ -521,14 +521,68 @@ class PET(ModelInterface[ModelHypers]):
             for k, v in atomic_predictions_dict.items():
                 return_dict[k] = v
 
-        # **Post-processing (Evaluation Only)**
-
+         # **Post-processing (Evaluation Only)**
         with torch.profiler.record_function("PET::post-processing"):
             if not self.training:
-                # at evaluation, we also introduce the scaler and additive contributions
-                return_dict = self.scaler(
-                    systems, return_dict, selected_atoms=selected_atoms
+                # Step 1: Split by atom_type for atomic basis targets.
+                # return_dict currently has 2D keys (o3_lambda, o3_sigma) with all
+                # atoms mixed together. We split into per-atom-type blocks with
+                # 3D keys (o3_lambda, o3_sigma, atom_type).
+                all_types = torch.concatenate(
+                    [system.types for system in systems]
                 )
+                species_masks: Dict[int, torch.Tensor] = {}
+                for species_index in range(len(self.atomic_types)):
+                    species_masks[species_index] = (all_types == species_index)
+
+                for target_name in self.atomic_basis_targets:
+                    if target_name not in return_dict:
+                        continue
+                        
+                    print(self.dataset_info.targets[target_name])
+
+                    v = return_dict[target_name]
+                    new_v_keys: List[torch.Tensor] = []
+                    new_v_blocks: List[TensorBlock] = []
+                    for key, block in v.items():
+                        for species_index in range(len(self.atomic_types)):
+                            atom_type = self.atomic_types[species_index]
+                            new_key_row = torch.cat([
+                                key.values,
+                                torch.tensor(
+                                    [atom_type],
+                                    dtype=torch.int32,
+                                    device=key.values.device,
+                                )
+                            ])
+                            new_v_keys.append(new_key_row)
+                            new_v_blocks.append(
+                                TensorBlock(
+                                    values=block.values[
+                                        species_masks[species_index]
+                                    ],
+                                    samples=Labels(
+                                        block.samples.names,
+                                        block.samples.values[
+                                            species_masks[species_index]
+                                        ],
+                                    ),
+                                    components=block.components,
+                                    properties=block.properties,
+                                )
+                            )
+                    return_dict[target_name] = TensorMap(
+                        Labels(
+                            names=v.keys.names + ["atom_type"],
+                            values=torch.vstack(new_v_keys),
+                        ),
+                        new_v_blocks,
+                    )
+
+                # Step 2: Add additive contributions.
+                # Both return_dict and additive_contributions now have 3D keys
+                # (o3_lambda, o3_sigma, atom_type) for atomic basis targets,
+                # so the block lookup works correctly.
                 for additive_model in self.additive_models:
                     outputs_for_additive_model: Dict[str, ModelOutput] = {}
                     for name, output in outputs.items():
@@ -540,17 +594,6 @@ class PET(ModelInterface[ModelHypers]):
                         selected_atoms,
                     )
                     for name in additive_contributions:
-                        # TODO: uncomment this after metatensor.torch.add
-                        # is updated to handle sparse sums
-                        # return_dict[name] = metatensor.torch.add(
-                        #     return_dict[name],
-                        #     additive_contributions[name].to(
-                        #         device=return_dict[name].device,
-                        #         dtype=return_dict[name].dtype
-                        #         ),
-                        # )
-                        # TODO: "manual" sparse sum: update to metatensor.torch.add
-                        # after sparse sum is implemented in metatensor.operations
                         output_blocks: List[TensorBlock] = []
                         for k, b in return_dict[name].items():
                             if k in additive_contributions[name].keys:
