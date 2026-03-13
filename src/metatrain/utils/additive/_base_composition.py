@@ -263,6 +263,16 @@ class BaseCompositionModel(torch.nn.Module):
                     )
                 X = X.to(device=device, dtype=dtype)
 
+                if "atom_type" in key.names:
+                    atom_type = int(key["atom_type"])
+                    all_types = torch.concatenate([system.types for system in systems])
+                    type_mask = (all_types == atom_type).to(device=device)
+                    X = X[
+                        type_mask
+                    ]  # This is needed because when accumulating for a block with atom_type in the key, 
+                        # X needs to be filtered to only include atoms of that type, otherwise a shape mismatch happens
+
+
                 # Compute "XTX", i.e. X.T @ X
                 # TODO: store XTX by sample kind instead, saving memory
                 self.XTX[target_name][key].values[:] += X.T @ X
