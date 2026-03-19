@@ -19,8 +19,12 @@ from metatomic.torch import (
 
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import ZBL, CompositionModel
+from metatrain.utils.data.atomic_basis_helpers import (
+    densify_atomic_basis_per_atom_target,
+    slice_samples_atomic_basis_per_atom_target,
+    sparsify_atomic_basis_target_per_atom,
+)
 from metatrain.utils.data import DatasetInfo, TargetInfo
-from metatrain.utils.data._merge_atom_types import merge_types
 from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
 from metatrain.utils.metadata import merge_metadata
@@ -161,6 +165,7 @@ class PET(ModelInterface[ModelHypers]):
         self.property_labels: Dict[str, List[Labels]] = {}
         self.component_labels: Dict[str, List[List[Labels]]] = {}
         self.target_names: List[str] = []
+        self.dataset_info = dataset_info
         self.last_layer_parameter_names: Dict[str, List[str]] = {}  # for LLPR
         for target_name, target_info in dataset_info.targets.items():
             self.target_names.append(target_name)
@@ -418,6 +423,7 @@ class PET(ModelInterface[ModelHypers]):
                 cutoff_factors,
                 system_indices,
                 sample_labels,
+                species,
             ) = systems_to_batch(
                 systems,
                 nl_options,
@@ -519,70 +525,31 @@ class PET(ModelInterface[ModelHypers]):
             )
 
             for k, v in atomic_predictions_dict.items():
+                if self.dataset_info.targets[k].is_atomic_basis:
+                    # Slice the samples to only keep atom types that are present in the
+                    # basis set
+                    v = slice_samples_atomic_basis_per_atom_target(
+                        species, v, self.dataset_info.targets[k].layout
+                    )
                 return_dict[k] = v
 
-         # **Post-processing (Evaluation Only)**
+        # **Post-processing (Evaluation Only)**
         with torch.profiler.record_function("PET::post-processing"):
             if not self.training:
-                # Step 1: Split by atom_type for atomic basis targets.
-                # return_dict currently has 2D keys (o3_lambda, o3_sigma) with all
-                # atoms mixed together. We split into per-atom-type blocks with
-                # 3D keys (o3_lambda, o3_sigma, atom_type).
-                all_types = torch.concatenate(
-                    [system.types for system in systems]
-                )
-                species_masks: Dict[int, torch.Tensor] = {}
-                for species_index in range(len(self.atomic_types)):
-                    species_masks[species_index] = (all_types == species_index)
 
-                for target_name in self.atomic_basis_targets:
-                    if target_name not in return_dict:
-                        continue
-                        
-                    print(self.dataset_info.targets[target_name])
+                # For atomic basis targets, slice samples to create blocks with
+                # "atom_type" in the key dimensions, and ensure properties are unpadded.
+                for k, v in atomic_predictions_dict.items():
+                    if self.dataset_info.targets[k].is_atomic_basis:
+                        return_dict[k] = sparsify_atomic_basis_target_per_atom(
+                            species, v, self.dataset_info.targets[k].layout
+                        )
 
-                    v = return_dict[target_name]
-                    new_v_keys: List[torch.Tensor] = []
-                    new_v_blocks: List[TensorBlock] = []
-                    for key, block in v.items():
-                        for species_index in range(len(self.atomic_types)):
-                            atom_type = self.atomic_types[species_index]
-                            new_key_row = torch.cat([
-                                key.values,
-                                torch.tensor(
-                                    [atom_type],
-                                    dtype=torch.int32,
-                                    device=key.values.device,
-                                )
-                            ])
-                            new_v_keys.append(new_key_row)
-                            new_v_blocks.append(
-                                TensorBlock(
-                                    values=block.values[
-                                        species_masks[species_index]
-                                    ],
-                                    samples=Labels(
-                                        block.samples.names,
-                                        block.samples.values[
-                                            species_masks[species_index]
-                                        ],
-                                    ),
-                                    components=block.components,
-                                    properties=block.properties,
-                                )
-                            )
-                    return_dict[target_name] = TensorMap(
-                        Labels(
-                            names=v.keys.names + ["atom_type"],
-                            values=torch.vstack(new_v_keys),
-                        ),
-                        new_v_blocks,
-                    )
-
-                # Step 2: Add additive contributions.
-                # Both return_dict and additive_contributions now have 3D keys
-                # (o3_lambda, o3_sigma, atom_type) for atomic basis targets,
-                # so the block lookup works correctly.
+                # at evaluation, we also introduce the scaler and additive contributions
+                # TODO @Joe: fix the scalar for Z-in-keys targets.
+                # return_dict = self.scaler(
+                #     systems, return_dict, selected_atoms=selected_atoms
+                # )
                 for additive_model in self.additive_models:
                     outputs_for_additive_model: Dict[str, ModelOutput] = {}
                     for name, output in outputs.items():
@@ -594,6 +561,17 @@ class PET(ModelInterface[ModelHypers]):
                         selected_atoms,
                     )
                     for name in additive_contributions:
+                        # TODO: uncomment this after metatensor.torch.add
+                        # is updated to handle sparse sums
+                        # return_dict[name] = metatensor.torch.add(
+                        #     return_dict[name],
+                        #     additive_contributions[name].to(
+                        #         device=return_dict[name].device,
+                        #         dtype=return_dict[name].dtype
+                        #         ),
+                        # )
+                        # TODO: "manual" sparse sum: update to metatensor.torch.add
+                        # after sparse sum is implemented in metatensor.operations
                         output_blocks: List[TensorBlock] = []
                         for k, b in return_dict[name].items():
                             if k in additive_contributions[name].keys:
@@ -1252,7 +1230,11 @@ class PET(ModelInterface[ModelHypers]):
         """
         output_layout = target_info.layout
         if target_info.is_atomic_basis:
-            output_layout = merge_types(output_layout)
+            # For now, this only supports on-site atomic basis targets
+            assert "atom" in output_layout.sample_names
+            output_layout = densify_atomic_basis_per_atom_target(
+                output_layout, output_layout
+            )
 
         # one output shape for each tensor block, grouped by target (i.e. tensormap)
         self.output_shapes[target_name] = {}

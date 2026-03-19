@@ -22,8 +22,9 @@ from metatrain.utils.data import (
     read_systems,
     unpack_batch,
 )
-from metatrain.utils.data._merge_atom_types import merge_types
-from metatrain.utils.data.spherical_target_helpers import match_predictions_to_targets
+from metatrain.utils.data.atomic_basis_helpers import (
+    get_reindex_to_batch_index_transform,
+)
 from metatrain.utils.data.writers import (
     DiskDatasetWriter,
     Writer,
@@ -178,9 +179,15 @@ def _eval_targets(
     # Create a dataloader
     target_keys = list(model.capabilities().outputs.keys())
     requested_neighbor_lists = get_requested_neighbor_lists(model)
+    atomic_basis_targets = {
+        name: target_info for name, target_info in options.items() if target_info.is_atomic_basis
+    }
     collate_fn = CollateFn(
         target_keys,
-        callables=[get_system_with_neighbor_lists_transform(requested_neighbor_lists)],
+        callables=[
+            get_system_with_neighbor_lists_transform(requested_neighbor_lists),
+            get_reindex_to_batch_index_transform(atomic_basis_targets, {})
+        ],
     )
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False
@@ -208,10 +215,6 @@ def _eval_targets(
     for batch in tqdm.tqdm(dataloader, ncols=100):
         systems, batch_targets, batch_extra_data = unpack_batch(batch)
 
-        for target_key, target_info in options.items():
-            if target_info.is_atomic_basis:
-                batch_targets[target_key] = merge_types(batch_targets[target_key])
-
         systems, batch_targets, batch_extra_data = batch_to(
             systems, batch_targets, batch_extra_data, dtype=dtype, device=device
         )
@@ -228,13 +231,6 @@ def _eval_targets(
             torch.cuda.synchronize()
         end_time = time.time()
 
-        target_keys = [key for key, info in options.items() if info.is_atomic_basis]
-        batch_targets, batch_predictions = match_predictions_to_targets(
-            targets=batch_targets,
-            predictions=batch_predictions,
-            extra_data=batch_extra_data,
-            target_keys=target_keys,
-        )
         # Update metrics
         preds_per_atom = average_by_num_atoms(
             batch_predictions, systems, per_structure_keys=[]

@@ -243,6 +243,21 @@ class BaseCompositionModel(torch.nn.Module):
 
         # accumulate
         for target_name, target in targets.items():
+
+            # Compute the X array
+            if self.sample_kinds[target_name] == "per_structure":
+                X = self._compute_X_per_structure(systems)
+
+            elif self.sample_kinds[target_name] == "per_atom":
+                X = self._compute_X_per_atom(systems, self.atomic_types)
+
+            else:
+                raise ValueError(
+                    f"unknown sample kind: {self.sample_kinds[target_name]}"
+                    f" for target {target_name}"
+                )
+            X = X.to(device=device, dtype=dtype)
+
             for key, block in target.items():
                 if not _include_key(key):
                     continue
@@ -250,36 +265,25 @@ class BaseCompositionModel(torch.nn.Module):
                 # Get the target block values
                 Y = block.values
 
-                if self.sample_kinds[target_name] == "per_structure":
-                    X = self._compute_X_per_structure(systems)
-
-                elif self.sample_kinds[target_name] == "per_atom":
-                    X = self._compute_X_per_atom(systems, self.atomic_types)
-
-                else:
-                    raise ValueError(
-                        f"unknown sample kind: {self.sample_kinds[target_name]}"
-                        f" for target {target_name}"
-                    )
-                X = X.to(device=device, dtype=dtype)
-
+                # For atomic basis targets, the blocks are already atom-type
+                # conditioned, so we need to slice X and Y to only include the relevant
+                # atomic type.
                 if "atom_type" in key.names:
-                    atom_type = int(key["atom_type"])
-                    all_types = torch.concatenate([system.types for system in systems])
-                    type_mask = (all_types == atom_type).to(device=device)
-                    X = X[
-                        type_mask
-                    ]  # This is needed because when accumulating for a block with atom_type in the key, 
-                        # X needs to be filtered to only include atoms of that type, otherwise a shape mismatch happens
-
+                    type_index = self.type_to_index[int(key["atom_type"])]
+                    atom_type_mask = X[
+                        :, self.type_to_index[int(key["atom_type"])]
+                    ].bool()
+                    X_ = X[atom_type_mask]
+                else:
+                    X_ = X
 
                 # Compute "XTX", i.e. X.T @ X
                 # TODO: store XTX by sample kind instead, saving memory
-                self.XTX[target_name][key].values[:] += X.T @ X
+                self.XTX[target_name][key].values[:] += X_.T @ X_
 
                 # Compute "XTY", i.e. X.T @ Y
                 self.XTY[target_name][key].values[:] += torch.tensordot(
-                    X, Y, dims=([0], [0])
+                    X_, Y, dims=([0], [0])
                 )
 
     def _sanitize_fixed_weights(
@@ -453,6 +457,19 @@ class BaseCompositionModel(torch.nn.Module):
                     ).to(device=device)
                     X_block = X[sample_indices]
 
+                # Handle the case of atomic basis targets where there is a subset of
+                # atoms in the samples of each block
+                if "atom_type" in key.names:
+                    atom_type = int(key["atom_type"])
+                    atom_type_mask = X_block[:, self.type_to_index[atom_type]].to(
+                        dtype=torch.bool
+                    )
+                    sample_labels_block = Labels(
+                        sample_labels_block.names,
+                        sample_labels_block.values[atom_type_mask],
+                    ).to(device=device)
+                    X_block = X_block[atom_type_mask]
+
                 # Compute X.T @ W
                 out_vals = torch.tensordot(
                     X_block, weight_block.values, dims=([1], [0])
@@ -564,6 +581,7 @@ def _include_key(key: LabelsEntry) -> bool:
     valid_key_names = [
         ["_"],  # scalar
         ["o3_lambda", "o3_sigma"],  # spherical
+        ["o3_lambda", "o3_sigma", "atom_type"],  # atomic basis onsite
     ]
     include_key = False
 
@@ -571,6 +589,10 @@ def _include_key(key: LabelsEntry) -> bool:
         include_key = True
 
     elif key.names == valid_key_names[1]:
+        if key["o3_lambda"] == 0 and key["o3_sigma"] == 1:
+            include_key = True
+
+    elif key.names == valid_key_names[2]:
         if key["o3_lambda"] == 0 and key["o3_sigma"] == 1:
             include_key = True
 
