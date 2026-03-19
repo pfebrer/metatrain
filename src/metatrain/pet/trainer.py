@@ -38,6 +38,7 @@ from metatrain.utils.neighbor_lists import (
     get_system_with_neighbor_lists_transform,
 )
 from metatrain.utils.per_atom import average_by_num_atoms
+from metatrain.utils.scaler import get_remove_scale_transform
 from metatrain.utils.transfer import batch_to
 
 from . import checkpoints
@@ -235,7 +236,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             callables=[
                 get_system_with_neighbor_lists_transform(requested_neighbor_lists),
                 get_remove_additive_transform(additive_models, train_targets),
-                # get_remove_scale_transform(scaler),  # TODO
+                get_remove_scale_transform(scaler),  # TODO
                 get_reindex_to_batch_index_transform(train_targets, extra_data_info),
                 get_densify_atomic_basis_targets_transform(
                     train_targets, extra_data_info
@@ -249,7 +250,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             callables=[  # no augmentation for validation
                 get_system_with_neighbor_lists_transform(requested_neighbor_lists),
                 get_remove_additive_transform(additive_models, train_targets),
-                # get_remove_scale_transform(scaler),  # TODO
+                get_remove_scale_transform(scaler),  # TODO
                 get_reindex_to_batch_index_transform(train_targets, extra_data_info),
                 get_densify_atomic_basis_targets_transform(
                     train_targets, extra_data_info
