@@ -1,13 +1,9 @@
-import itertools
-from collections import defaultdict
-from typing import Callable, Dict, List, Literal, Optional, Tuple
-
-import numpy as np
-import torch
-from metatomic.torch import System
+from typing import Callable, Dict, List, Tuple
 
 import metatensor.torch as mts
+import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
+from metatomic.torch import System
 
 from .target_info import TargetInfo
 
@@ -143,7 +139,6 @@ def densify_atomic_basis_per_atom_target(
         i for i, name in enumerate(tensor.keys.names) if not name.endswith("atom_type")
     ]
     type_names = [tensor.keys.names[i] for i in type_indices]
-    non_type_names = [tensor.keys.names[i] for i in non_type_indices]
 
     # Using the layout TensorMap, build the union of the property labels values across
     # all atom types
@@ -238,7 +233,6 @@ def get_densify_atomic_basis_targets_transform(
         """
         for name, tensor in targets.items():
             if name in target_info_dict and target_info_dict[name].is_atomic_basis:
-
                 # TODO: in next PR, add support for per-pair targets (both Cartesian and
                 # coupled product basis)
                 if tensor.keys.names == ["o3_lambda", "o3_sigma", "atom_type"]:
@@ -254,7 +248,6 @@ def get_densify_atomic_basis_targets_transform(
 
         for name, tensor in extra.items():
             if name in target_info_dict and target_info_dict[name].is_atomic_basis:
-
                 # TODO: in next PR, add support for per-pair targets (both Cartesian and
                 # coupled product basis)
                 if tensor.keys.names == ["o3_lambda", "o3_sigma", "atom_type"]:
@@ -332,7 +325,6 @@ def sparsify_atomic_basis_target_per_atom(
     new_blocks: List[TensorBlock] = []
     for key, block in tensor.items():
         for atom_type in unique_types:
-
             new_key = torch.cat([key.values[:2], atom_type.view(1)], dim=0)
             new_block = TensorBlock(
                 values=block.values[atom_type_masks[atom_type.item()]],
@@ -356,7 +348,6 @@ def sparsify_atomic_basis_target_per_atom(
     new_keys: List[torch.Tensor] = []
     unpadded_blocks: List[TensorBlock] = []
     for key, block in tensor.items():
-
         if key not in layout.keys:
             continue
 
@@ -371,7 +362,4 @@ def sparsify_atomic_basis_target_per_atom(
         )
         unpadded_blocks.append(new_block)
 
-    return TensorMap(
-        Labels(tensor.keys.names, torch.vstack(new_keys)),
-        unpadded_blocks
-    )
+    return TensorMap(Labels(tensor.keys.names, torch.vstack(new_keys)), unpadded_blocks)

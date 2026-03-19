@@ -19,12 +19,12 @@ from metatomic.torch import (
 
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import ZBL, CompositionModel
+from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atomic_basis_helpers import (
     densify_atomic_basis_per_atom_target,
     slice_samples_atomic_basis_per_atom_target,
     sparsify_atomic_basis_target_per_atom,
 )
-from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
 from metatrain.utils.metadata import merge_metadata
@@ -536,7 +536,6 @@ class PET(ModelInterface[ModelHypers]):
         # **Post-processing (Evaluation Only)**
         with torch.profiler.record_function("PET::post-processing"):
             if not self.training:
-
                 # For atomic basis targets, slice samples to create blocks with
                 # "atom_type" in the key dimensions, and ensure properties are unpadded.
                 for k, v in atomic_predictions_dict.items():

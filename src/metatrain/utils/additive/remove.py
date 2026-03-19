@@ -3,7 +3,7 @@ from typing import Callable, Dict, List, Tuple
 
 import metatensor.torch as mts
 import torch
-from metatensor.torch import TensorMap, Labels
+from metatensor.torch import Labels, TensorMap
 from metatensor.torch.operations._add import _add_block_block
 from metatensor.torch.operations._multiply import _multiply_block_constant
 from metatomic.torch import System
@@ -61,7 +61,7 @@ def remove_additive(
             if block_key not in targets[target_key].keys:
                 # This happens in the case of atomic basis targets, where weights blocks
                 # exist for all global atom types but ht etarget may only contain a
-                # subset of those. 
+                # subset of those.
                 assert target_info_dict[target_key].is_atomic_basis
                 continue
             key_vals.append(block_key.values)
@@ -93,8 +93,7 @@ def remove_additive(
             blocks.append(block)
         additive_contribution[target_key] = TensorMap(
             keys=Labels(
-                additive_contribution[target_key].keys.names,
-                torch.vstack(key_vals)
+                additive_contribution[target_key].keys.names, torch.vstack(key_vals)
             ).to(device=device),
             blocks=blocks,
         )

@@ -243,7 +243,6 @@ class BaseCompositionModel(torch.nn.Module):
 
         # accumulate
         for target_name, target in targets.items():
-
             # Compute the X array
             if self.sample_kinds[target_name] == "per_structure":
                 X = self._compute_X_per_structure(systems)
@@ -269,7 +268,6 @@ class BaseCompositionModel(torch.nn.Module):
                 # conditioned, so we need to slice X and Y to only include the relevant
                 # atomic type.
                 if "atom_type" in key.names:
-                    type_index = self.type_to_index[int(key["atom_type"])]
                     atom_type_mask = X[
                         :, self.type_to_index[int(key["atom_type"])]
                     ].bool()

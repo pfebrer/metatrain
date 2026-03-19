@@ -180,13 +180,15 @@ def _eval_targets(
     target_keys = list(model.capabilities().outputs.keys())
     requested_neighbor_lists = get_requested_neighbor_lists(model)
     atomic_basis_targets = {
-        name: target_info for name, target_info in options.items() if target_info.is_atomic_basis
+        name: target_info
+        for name, target_info in options.items()
+        if target_info.is_atomic_basis
     }
     collate_fn = CollateFn(
         target_keys,
         callables=[
             get_system_with_neighbor_lists_transform(requested_neighbor_lists),
-            get_reindex_to_batch_index_transform(atomic_basis_targets, {})
+            get_reindex_to_batch_index_transform(atomic_basis_targets, {}),
         ],
     )
     dataloader = torch.utils.data.DataLoader(

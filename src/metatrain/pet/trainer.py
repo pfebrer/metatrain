@@ -20,8 +20,8 @@ from metatrain.utils.data import (
     validate_num_workers,
 )
 from metatrain.utils.data.atomic_basis_helpers import (
-    get_reindex_to_batch_index_transform,
     get_densify_atomic_basis_targets_transform,
+    get_reindex_to_batch_index_transform,
 )
 from metatrain.utils.distributed.batch_utils import should_skip_batch
 from metatrain.utils.distributed.distributed_data_parallel import (
@@ -38,7 +38,6 @@ from metatrain.utils.neighbor_lists import (
     get_system_with_neighbor_lists_transform,
 )
 from metatrain.utils.per_atom import average_by_num_atoms
-from metatrain.utils.scaler import get_remove_scale_transform
 from metatrain.utils.transfer import batch_to
 
 from . import checkpoints
@@ -238,7 +237,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 get_remove_additive_transform(additive_models, train_targets),
                 # get_remove_scale_transform(scaler),  # TODO
                 get_reindex_to_batch_index_transform(train_targets, extra_data_info),
-                get_densify_atomic_basis_targets_transform(train_targets, extra_data_info),
+                get_densify_atomic_basis_targets_transform(
+                    train_targets, extra_data_info
+                ),
                 rotational_augmenter.apply_random_augmentations,
             ],
             batch_atom_bounds=self.hypers["batch_atom_bounds"],
@@ -250,7 +251,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 get_remove_additive_transform(additive_models, train_targets),
                 # get_remove_scale_transform(scaler),  # TODO
                 get_reindex_to_batch_index_transform(train_targets, extra_data_info),
-                get_densify_atomic_basis_targets_transform(train_targets, extra_data_info),
+                get_densify_atomic_basis_targets_transform(
+                    train_targets, extra_data_info
+                ),
             ],
             batch_atom_bounds=self.hypers["batch_atom_bounds"],
         )

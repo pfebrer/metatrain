@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
 import torch
-
 from metatensor.torch import Labels, TensorBlock, TensorMap, equal_metadata
 from metatomic.torch import ModelOutput
 from omegaconf import DictConfig
@@ -612,6 +611,7 @@ def _get_spherical_target_info(target_name: str, target: DictConfig) -> TargetIn
         description=target.get("description", ""),
     )
     return info
+
 
 def _build_spherical_target_block(
     sample_names: List[str],
