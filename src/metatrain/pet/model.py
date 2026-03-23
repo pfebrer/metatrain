@@ -529,8 +529,8 @@ class PET(ModelInterface[ModelHypers]):
         # **Post-processing (Evaluation Only)**
         with torch.profiler.record_function("PET::post-processing"):
             if not self.training:
-                # For atomic basis targets, slice samples to create blocks with
-                # "atom_type" in the key dimensions, and ensure properties are unpadded.
+                # For atomic basis targets, sparsify to create blocks with "atom_type"
+                # in the key dimensions, and ensure properties are unpadded.
                 for k, v in atomic_predictions_dict.items():
                     if self.dataset_info.targets[k].is_atomic_basis:
                         return_dict[k] = sparsify_atomic_basis_target(
@@ -538,10 +538,9 @@ class PET(ModelInterface[ModelHypers]):
                         )
 
                 # at evaluation, we also introduce the scaler and additive contributions
-                # TODO @Joe: fix the scalar for Z-in-keys targets.
-                # return_dict = self.scaler(
-                #     systems, return_dict, selected_atoms=selected_atoms
-                # )
+                return_dict = self.scaler(
+                    systems, return_dict, selected_atoms=selected_atoms
+                )
                 for additive_model in self.additive_models:
                     outputs_for_additive_model: Dict[str, ModelOutput] = {}
                     for name, output in outputs.items():
@@ -553,17 +552,6 @@ class PET(ModelInterface[ModelHypers]):
                         selected_atoms,
                     )
                     for name in additive_contributions:
-                        # TODO: uncomment this after metatensor.torch.add
-                        # is updated to handle sparse sums
-                        # return_dict[name] = metatensor.torch.add(
-                        #     return_dict[name],
-                        #     additive_contributions[name].to(
-                        #         device=return_dict[name].device,
-                        #         dtype=return_dict[name].dtype
-                        #         ),
-                        # )
-                        # TODO: "manual" sparse sum: update to metatensor.torch.add
-                        # after sparse sum is implemented in metatensor.operations
                         output_blocks: List[TensorBlock] = []
                         for k, b in return_dict[name].items():
                             if k in additive_contributions[name].keys:
