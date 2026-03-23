@@ -50,62 +50,6 @@ def reindex_to_batch_index(
     return TensorMap(tensor.keys, blocks)
 
 
-def get_reindex_to_batch_index_transform(
-    target_info_dict: dict[str, TargetInfo],
-    extra_data_info_dict: dict[str, TargetInfo],
-) -> Callable:
-    """
-    Get a function that reindexes the systems to have batch ids.
-
-    :param target_info_dict: Dictionary mapping target names to TargetInfo objects.
-    :param extra_data_info_dict: Dictionary mapping extra data names to TargetInfo
-        objects.
-
-    :return: A function that takes in systems, targets and extra data, and returns the
-        systems, targets and extra data with reindexed batch ids.
-    """
-
-    def transform(
-        systems: List[System],
-        targets: Dict[str, TensorMap],
-        extra: Dict[str, TensorMap],
-    ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
-        """
-        Transform function that reindexes the systems to have batch ids, modifying
-        in-place. Only applied to atomic basis targets and extra data.
-
-        :param systems: List of systems.
-        :param targets: Dictionary containing the targets corresponding to the systems.
-        :param extra: Dictionary containing any extra data.
-        :return: The systems, targets and extra data with reindexed system ids.
-        """
-        assert "mtt::aux::system_index" in extra
-        for name, tensor in targets.items():
-            if name in target_info_dict and target_info_dict[name].is_atomic_basis:
-                targets[name] = reindex_to_batch_index(
-                    tensor,
-                    extra["mtt::aux::system_index"][0]
-                    .values[:, 0]
-                    .to(dtype=torch.int64),
-                )
-
-        for name, tensor in extra.items():
-            if (
-                name in extra_data_info_dict
-                and extra_data_info_dict[name].is_atomic_basis
-            ):
-                extra[name] = reindex_to_batch_index(
-                    tensor,
-                    extra["mtt::aux::system_index"][0]
-                    .values[:, 0]
-                    .to(dtype=torch.int64),
-                )
-
-        return systems, targets, extra
-
-    return transform
-
-
 def get_per_atom_sample_labels(
     systems: List[System],
 ) -> Labels:
@@ -329,7 +273,7 @@ def pad_samples_atomic_basis_target(
     )
 
 
-def prepare_atomic_basis_targets_batch(
+def prepare_atomic_basis_targets(
     systems: List[System],
     system_ids: torch.Tensor,
     tensor: TensorMap,
@@ -363,78 +307,6 @@ def prepare_atomic_basis_targets_batch(
     tensor = pad_samples_atomic_basis_target(systems, tensor)
 
     return tensor
-
-
-def get_prepare_atomic_basis_targets_batch_transform(
-    target_info_dict: dict[str, TargetInfo],
-    extra_data_info_dict: dict[str, TargetInfo],
-) -> Callable:
-    """
-    Get a function that prepares the atomic basis targets for batching by reindexing to
-    batch ids, densifying and padding.
-
-    :param target_info_dict: Dictionary mapping target names to TargetInfo objects.
-    :param extra_data_info_dict: Dictionary mapping extra data names to TargetInfo
-        objects.
-
-    :return: A function that takes in systems, targets and extra data, and returns the
-        systems, targets and extra data with prepared atomic basis targets.
-    """
-
-    def transform(
-        systems: List[System],
-        targets: Dict[str, TensorMap],
-        extra: Dict[str, TensorMap],
-    ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
-        """
-        Transform function that prepares the atomic basis targets for batching by
-        reindexing to batch ids, densifying and padding, modifying in-place.
-
-        :param systems: List of systems.
-        :param targets: Dictionary containing the targets corresponding to the systems.
-        :param extra: Dictionary containing any extra data.
-        :return: The systems, targets and extra data with prepared atomic basis targets.
-        """
-        for name, tensor in targets.items():
-            if name in target_info_dict and target_info_dict[name].is_atomic_basis:
-                assert "mtt::aux::system_index" in extra
-                system_ids = (
-                    extra["mtt::aux::system_index"][0]
-                    .values[:, 0]
-                    .to(dtype=torch.int64)
-                )
-
-                targets[name] = prepare_atomic_basis_targets_batch(
-                    systems,
-                    system_ids,
-                    tensor,
-                    target_info_dict[name].layout,
-                    fill_value=torch.nan,
-                )
-
-        for name, tensor in extra.items():
-            if (
-                name in extra_data_info_dict
-                and extra_data_info_dict[name].is_atomic_basis
-            ):
-                assert "mtt::aux::system_index" in extra
-                system_ids = (
-                    extra["mtt::aux::system_index"][0]
-                    .values[:, 0]
-                    .to(dtype=torch.int64)
-                )
-
-                extra[name] = prepare_atomic_basis_targets_batch(
-                    systems,
-                    system_ids,
-                    tensor,
-                    extra_data_info_dict[name].layout,
-                    fill_value=torch.nan,
-                )
-
-        return systems, targets, extra
-
-    return transform
 
 
 # ===== Sparsification utilities (atom types back to keys)
@@ -546,3 +418,166 @@ def sparsify_atomic_basis_target(
     raise NotImplementedError(
         "Currently only sparsification of per-atom atomic basis targets is implemented."
     )
+
+
+# ===== dataloader transforms
+
+
+def get_reindex_to_batch_index_transform(
+    target_info_dict: dict[str, TargetInfo],
+    extra_data_info_dict: dict[str, TargetInfo],
+) -> Callable:
+    """
+    Get a function that reindexes the systems to have batch ids.
+
+    :param target_info_dict: Dictionary mapping target names to TargetInfo objects.
+    :param extra_data_info_dict: Dictionary mapping extra data names to TargetInfo
+        objects.
+
+    :return: A function that takes in systems, targets and extra data, and returns the
+        systems, targets and extra data with reindexed batch ids.
+    """
+
+    def transform(
+        systems: List[System],
+        targets: Dict[str, TensorMap],
+        extra: Dict[str, TensorMap],
+    ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
+        """
+        Transform function that reindexes the systems to have batch ids, modifying
+        in-place. Only applied to atomic basis targets and extra data.
+
+        :param systems: List of systems.
+        :param targets: Dictionary containing the targets corresponding to the systems.
+        :param extra: Dictionary containing any extra data.
+        :return: The systems, targets and extra data with reindexed system ids.
+        """
+        assert "mtt::aux::system_index" in extra
+        for name, tensor in targets.items():
+            if name in target_info_dict and target_info_dict[name].is_atomic_basis:
+                targets[name] = reindex_to_batch_index(
+                    tensor,
+                    extra["mtt::aux::system_index"][0]
+                    .values[:, 0]
+                    .to(dtype=torch.int64),
+                )
+
+        for name, tensor in extra.items():
+            if (
+                name in extra_data_info_dict
+                and extra_data_info_dict[name].is_atomic_basis
+            ):
+                extra[name] = reindex_to_batch_index(
+                    tensor,
+                    extra["mtt::aux::system_index"][0]
+                    .values[:, 0]
+                    .to(dtype=torch.int64),
+                )
+
+        return systems, targets, extra
+
+    return transform
+
+
+def get_prepare_atomic_basis_targets_transform(
+    target_info_dict: dict[str, TargetInfo],
+    extra_data_info_dict: dict[str, TargetInfo],
+) -> Tuple[Callable, Callable]:
+    """
+    Get a function that prepares the atomic basis targets for batching by reindexing to
+    batch ids, densifying and padding.
+
+    :param target_info_dict: Dictionary mapping target names to TargetInfo objects.
+    :param extra_data_info_dict: Dictionary mapping extra data names to TargetInfo
+        objects.
+
+    :return: A function that takes in systems, targets and extra data, and returns the
+        systems, targets and extra data with prepared atomic basis targets.
+    """
+
+    def transform(
+        systems: List[System],
+        targets: Dict[str, TensorMap],
+        extra: Dict[str, TensorMap],
+    ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
+        """
+        Transform function that prepares the atomic basis targets for batching by
+        reindexing to batch ids, densifying and padding, modifying in-place.
+
+        :param systems: List of systems.
+        :param targets: Dictionary containing the targets corresponding to the systems.
+        :param extra: Dictionary containing any extra data.
+        :return: The systems, targets and extra data with prepared atomic basis targets.
+        """
+        for name, tensor in targets.items():
+            if name in target_info_dict and target_info_dict[name].is_atomic_basis:
+                assert "mtt::aux::system_index" in extra
+                system_ids = (
+                    extra["mtt::aux::system_index"][0]
+                    .values[:, 0]
+                    .to(dtype=torch.int64)
+                )
+
+                targets[name] = prepare_atomic_basis_targets(
+                    systems,
+                    system_ids,
+                    tensor,
+                    target_info_dict[name].layout,
+                    fill_value=torch.nan,
+                )
+
+        for name, tensor in extra.items():
+            if (
+                name in extra_data_info_dict
+                and extra_data_info_dict[name].is_atomic_basis
+            ):
+                assert "mtt::aux::system_index" in extra
+                system_ids = (
+                    extra["mtt::aux::system_index"][0]
+                    .values[:, 0]
+                    .to(dtype=torch.int64)
+                )
+
+                extra[name] = prepare_atomic_basis_targets(
+                    systems,
+                    system_ids,
+                    tensor,
+                    extra_data_info_dict[name].layout,
+                    fill_value=torch.nan,
+                )
+
+        return systems, targets, extra
+
+    def reverse_transform(
+        systems: List[System],
+        targets: Dict[str, TensorMap],
+        extra: Dict[str, TensorMap],
+    ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
+        """
+        Reverse transform function that unpads, undensifies and reindexes the atomic
+        basis targets, modifying in-place.
+
+        :param systems: List of systems.
+        :param targets: Dictionary containing the targets corresponding to the systems.
+        :param extra: Dictionary containing any extra data.
+        :return: The systems, targets and extra data with unprepared atomic basis
+            targets.
+        """
+        for name, tensor in targets.items():
+            if name in target_info_dict and target_info_dict[name].is_atomic_basis:
+                targets[name] = sparsify_atomic_basis_target(
+                    systems, tensor, target_info_dict[name].layout
+                )
+
+        for name, tensor in extra.items():
+            if (
+                name in extra_data_info_dict
+                and extra_data_info_dict[name].is_atomic_basis
+            ):
+                extra[name] = sparsify_atomic_basis_target(
+                    systems, tensor, extra_data_info_dict[name].layout
+                )
+
+        return systems, targets, extra
+
+    return transform, reverse_transform
