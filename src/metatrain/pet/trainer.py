@@ -20,8 +20,8 @@ from metatrain.utils.data import (
     validate_num_workers,
 )
 from metatrain.utils.data.atomic_basis_helpers import (
-    get_densify_atomic_basis_targets_transform,
-    get_reindex_to_batch_index_transform,
+    get_prepare_atomic_basis_targets_batch_transform,
+    sparsify_atomic_basis_target,
 )
 from metatrain.utils.distributed.batch_utils import should_skip_batch
 from metatrain.utils.distributed.distributed_data_parallel import (
@@ -236,9 +236,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
             callables=[
                 get_system_with_neighbor_lists_transform(requested_neighbor_lists),
                 get_remove_additive_transform(additive_models, train_targets),
-                get_remove_scale_transform(scaler),  # TODO
-                get_reindex_to_batch_index_transform(train_targets, extra_data_info),
-                get_densify_atomic_basis_targets_transform(
+                get_remove_scale_transform(scaler),
+                get_prepare_atomic_basis_targets_batch_transform(
                     train_targets, extra_data_info
                 ),
                 rotational_augmenter.apply_random_augmentations,
@@ -250,9 +249,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
             callables=[  # no augmentation for validation
                 get_system_with_neighbor_lists_transform(requested_neighbor_lists),
                 get_remove_additive_transform(additive_models, train_targets),
-                get_remove_scale_transform(scaler),  # TODO
-                get_reindex_to_batch_index_transform(train_targets, extra_data_info),
-                get_densify_atomic_basis_targets_transform(
+                get_remove_scale_transform(scaler),
+                get_prepare_atomic_basis_targets_batch_transform(
                     train_targets, extra_data_info
                 ),
             ],
@@ -434,6 +432,19 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     torch.distributed.all_reduce(train_loss_batch)
                 train_loss += train_loss_batch.item()
 
+                # if any atomic basis outputs are present, sparsify them before
+                # calculating metrics
+                for name, tensor in predictions.items():
+                    if train_targets[name].is_atomic_basis:
+                        predictions[name] = sparsify_atomic_basis_target(
+                            systems, tensor, train_targets[name].layout
+                        )
+                for name, tensor in targets.items():
+                    if train_targets[name].is_atomic_basis:
+                        targets[name] = sparsify_atomic_basis_target(
+                            systems, tensor, train_targets[name].layout
+                        )
+
                 scaled_predictions = (model.module if is_distributed else model).scaler(
                     systems, predictions
                 )
@@ -495,6 +506,19 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         # sum the loss over all processes
                         torch.distributed.all_reduce(val_loss_batch)
                     val_loss += val_loss_batch.item()
+
+                    # if any atomic basis outputs are present, sparsify them before
+                    # calculating metrics
+                    for name, tensor in predictions.items():
+                        if train_targets[name].is_atomic_basis:
+                            predictions[name] = sparsify_atomic_basis_target(
+                                systems, tensor, train_targets[name].layout
+                            )
+                    for name, tensor in targets.items():
+                        if train_targets[name].is_atomic_basis:
+                            targets[name] = sparsify_atomic_basis_target(
+                                systems, tensor, train_targets[name].layout
+                            )
 
                     scaled_predictions = (
                         model.module if is_distributed else model

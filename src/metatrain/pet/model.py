@@ -21,9 +21,8 @@ from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import ZBL, CompositionModel
 from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atomic_basis_helpers import (
-    densify_atomic_basis_per_atom_target,
-    slice_samples_atomic_basis_per_atom_target,
-    sparsify_atomic_basis_target_per_atom,
+    densify_atomic_basis_target,
+    sparsify_atomic_basis_target,
 )
 from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
@@ -525,12 +524,6 @@ class PET(ModelInterface[ModelHypers]):
             )
 
             for k, v in atomic_predictions_dict.items():
-                if self.dataset_info.targets[k].is_atomic_basis:
-                    # Slice the samples to only keep atom types that are present in the
-                    # basis set
-                    v = slice_samples_atomic_basis_per_atom_target(
-                        species, v, self.dataset_info.targets[k].layout
-                    )
                 return_dict[k] = v
 
         # **Post-processing (Evaluation Only)**
@@ -540,8 +533,8 @@ class PET(ModelInterface[ModelHypers]):
                 # "atom_type" in the key dimensions, and ensure properties are unpadded.
                 for k, v in atomic_predictions_dict.items():
                     if self.dataset_info.targets[k].is_atomic_basis:
-                        return_dict[k] = sparsify_atomic_basis_target_per_atom(
-                            species, v, self.dataset_info.targets[k].layout
+                        return_dict[k] = sparsify_atomic_basis_target(
+                            systems, v, self.dataset_info.targets[k].layout, species
                         )
 
                 # at evaluation, we also introduce the scaler and additive contributions
@@ -1229,11 +1222,7 @@ class PET(ModelInterface[ModelHypers]):
         """
         output_layout = target_info.layout
         if target_info.is_atomic_basis:
-            # For now, this only supports on-site atomic basis targets
-            assert "atom" in output_layout.sample_names
-            output_layout = densify_atomic_basis_per_atom_target(
-                output_layout, output_layout
-            )
+            output_layout = densify_atomic_basis_target(output_layout, output_layout)
 
         # one output shape for each tensor block, grouped by target (i.e. tensormap)
         self.output_shapes[target_name] = {}

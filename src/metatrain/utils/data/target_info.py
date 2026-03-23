@@ -555,14 +555,7 @@ def _get_spherical_target_info(target_name: str, target: DictConfig) -> TargetIn
         )
 
     if is_atomic_basis:
-        if product is None:
-            keys_names.append("atom_type")
-        else:
-            if "atom" in sample_names:
-                keys_names.append("atom_type")
-            else:
-                assert "first_atom" in target.layout.sample_names
-                keys_names.extend(["first_atom_type", "second_atom_type"])
+        keys_names.append("atom_type")
 
     # Build the tensormap blocks, and store their corresponding keys.
     if not is_atomic_basis:
