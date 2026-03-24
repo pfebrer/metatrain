@@ -216,9 +216,11 @@ def test_rotation_per_atom_spherical(batch_size):
     # Check that the rotated target matches the reference
     mts.allclose_raise(RfX, fRX, atol=1e-5)
 
+
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_rotation_per_atom_spherical_hamiltonian(batch_size):
-    """Tests that the rotational augmenter rotates a Hamiltonian (rank-2 tensor)
+def test_rotation_per_atom_spherical_atomicbasis(batch_size):
+    """Tests that the rotational augmenter rotates a Hamiltonian
+    in the coupled basis (rank 1 tensors with an atomic basis)
     consistent with targets computed from DFT"""
     target_name = "mtt::hamiltonian_nodes"
 
@@ -233,7 +235,7 @@ def test_rotation_per_atom_spherical_hamiltonian(batch_size):
 
     # Load the target data
     dataset_unrotated = DiskDataset(RESOURCES_PATH / "spherical_targets_unrotated.zip")
-    dataset_rotated   = DiskDataset(RESOURCES_PATH / "spherical_targets_rotated.zip")
+    dataset_rotated = DiskDataset(RESOURCES_PATH / "spherical_targets_rotated.zip")
 
     X = [
         sample["system"].to(torch.float64)
@@ -305,10 +307,12 @@ def test_rotation_per_atom_spherical_hamiltonian(batch_size):
     # Check that the rotated target matches the reference
     mts.allclose_raise(RfX, fRX, atol=1e-5)
 
+
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_rotation_per_atom_spherical_hamiltonian_uncoupled(batch_size):
-    """Tests that the uncoupled Hamiltonian (rank-2 tensor) transforms correctly
-    under rotation, i.e. H(RX)_{mu1,mu2} = D_l1(R) @ H(X) @ D_l2(R)^T"""
+def test_rotation_per_atom_spherical_rank2(batch_size):
+    """Tests that the rotational augmenter rotates a Hamiltonian
+    in the uncoupled basis (rank 2 tensors with an atomic basis)
+    consistent with targets computed from DFT"""
     target_name = "mtt::hamiltonian_nodes_uncoupled"
 
     # Hard-coded rotation matrix used to generate the system for which DFT was run
@@ -322,7 +326,7 @@ def test_rotation_per_atom_spherical_hamiltonian_uncoupled(batch_size):
 
     # Load the target data
     dataset_unrotated = DiskDataset(RESOURCES_PATH / "spherical_targets_unrotated.zip")
-    dataset_rotated   = DiskDataset(RESOURCES_PATH / "spherical_targets_rotated.zip")
+    dataset_rotated = DiskDataset(RESOURCES_PATH / "spherical_targets_rotated.zip")
 
     X = [
         sample["system"].to(torch.float64)
@@ -393,6 +397,7 @@ def test_rotation_per_atom_spherical_hamiltonian_uncoupled(batch_size):
 
     # Check that the rotated target matches the reference
     mts.allclose_raise(RfX, fRX, atol=1e-5)
+
 
 def test_missing_library(monkeypatch, layout_spherical):
     # Pretend 'spherical' is not installed
