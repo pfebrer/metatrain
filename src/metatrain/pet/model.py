@@ -552,6 +552,17 @@ class PET(ModelInterface[ModelHypers]):
                         selected_atoms,
                     )
                     for name in additive_contributions:
+                        # TODO: uncomment this after metatensor.torch.add
+                        # is updated to handle sparse sums
+                        # return_dict[name] = metatensor.torch.add(
+                        #     return_dict[name],
+                        #     additive_contributions[name].to(
+                        #         device=return_dict[name].device,
+                        #         dtype=return_dict[name].dtype
+                        #         ),
+                        # )
+                        # TODO: "manual" sparse sum: update to metatensor.torch.add
+                        # after sparse sum is implemented in metatensor.operations
                         output_blocks: List[TensorBlock] = []
                         for k, b in return_dict[name].items():
                             if k in additive_contributions[name].keys:
