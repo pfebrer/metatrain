@@ -180,7 +180,7 @@ def _densify_per_atom_atomic_basis_target(
         )
 
         # Now broadcast the existing values to the new shape
-        properties_mask = properties.to(block.samples.device).select(block.properties)
+        properties_mask = properties.select(block.properties)
         padded_values[..., properties_mask] = block.values
         padded_block = TensorBlock(
             values=padded_values,
@@ -239,7 +239,7 @@ def _pad_samples_per_atom_atomic_basis_target(
             fill_value=torch.nan,
             dtype=block.values.dtype,
         )
-        sample_mask = sample_labels.to(block.samples.device).select(block.samples)
+        sample_mask = sample_labels.select(block.samples)
         new_vals[sample_mask] = block.values
         new_block = TensorBlock(
             values=new_vals,
