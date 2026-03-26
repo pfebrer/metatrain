@@ -19,6 +19,7 @@ from ..transfer import batch_to
 from ._base_composition import (
     BaseCompositionModel,
     FixedCompositionWeights,
+    _get_trace_component_mask,
     _include_key,
 )
 from .remove import remove_additive
@@ -388,27 +389,41 @@ class CompositionModel(torch.nn.Module):
                 assume_unique=True,
             ),
         )
+        
+        fake_weight_blocks = []
+        for b in layout.blocks():
+            trace_mask = _get_trace_component_mask(b.components)
+            if trace_mask is not None:
+                # Uncoupled Hamiltonian block - use only trace components
+                trace_components = [
+                    Labels(
+                        names=b.components[0].names,
+                        values=b.components[0].values[trace_mask],
+                    )
+                ]
+                values_shape = (len(self.atomic_types), int(trace_mask.sum()), len(b.properties))
+
+            else:
+                # Standard block - use all components
+                trace_components = b.components
+                values_shape = (len(self.atomic_types),) + b.values.shape[1:]
+            
+            fake_weight_blocks.append(
+                TensorBlock(
+                    values=torch.zeros(values_shape, dtype=torch.float64),
+                    samples=Labels(
+                        names=["center_type"],
+                        values=torch.tensor(self.atomic_types, dtype=torch.int).reshape(-1, 1),
+                        assume_unique=True,
+                    ),
+                    components=trace_components,
+                    properties=b.properties,
+                )
+            )
 
         fake_weights = TensorMap(
             keys=layout.keys,
-            blocks=[
-                TensorBlock(
-                    values=torch.zeros(
-                        (len(self.atomic_types),) + b.values.shape[1:],
-                        dtype=torch.float64,
-                    ),
-                    samples=Labels(
-                        names=["center_type"],
-                        values=torch.tensor(self.atomic_types, dtype=torch.int).reshape(
-                            -1, 1
-                        ),
-                        assume_unique=True,
-                    ),
-                    components=b.components,
-                    properties=b.properties,
-                )
-                for b in layout.blocks()
-            ],
+            blocks=fake_weight_blocks
         )
         self.register_buffer(
             target_name + "_composition_buffer",
@@ -439,11 +454,16 @@ class CompositionModel(torch.nn.Module):
         """
         # only scalars can have composition contributions
         if not target_info.is_scalar and not target_info.is_spherical:
-            logging.debug(
-                f"Composition model does not support target {target_name} "
-                "since it is not either scalar or spherical."
-            )
-            return False
+            # Also allow uncoupled Hamiltonian targets
+            if not(
+                "o3_lambda_1" in target_info.layout.keys.names
+                and "o3_lambda_2" in target_info.layout.keys.names
+            ):
+                logging.debug(
+                    f"Composition model does not support target {target_name} "
+                    "since it is not either scalar, spherical, or uncoupled Hamiltonian."
+                )
+                return False
         if target_info.is_spherical and (
             "o3_lambda" not in target_info.layout.keys.names  # Rank 2
             or len(target_info.layout.blocks({"o3_lambda": 0, "o3_sigma": 1}))

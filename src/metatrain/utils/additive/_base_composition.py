@@ -179,40 +179,55 @@ class BaseCompositionModel(torch.nn.Module):
                 for _ in layout
             ],
         )
-        self.XTY[target_name] = TensorMap(
-            layout.keys,
-            blocks=[
+            # For XTY and weights, use only trace components for uncoupled blocks
+        xty_blocks = []
+        weight_blocks = []
+        for block in layout:
+            trace_mask = _get_trace_component_mask(block.components)
+
+            if trace_mask is not None:
+                # Uncoupled Hamiltonian block — only keep trace components
+                trace_components = [
+                    Labels(
+                        names=block.components[0].names,
+                        values=block.components[0].values[trace_mask],
+                    )
+                ]
+                n_components = [int(trace_mask.sum())]
+            else:
+                # Standard block — keep all components
+                trace_components = block.components
+                n_components = [len(c) for c in block.components]
+
+            xty_blocks.append(
                 TensorBlock(
                     values=torch.zeros(
                         len(self.atomic_types),
-                        *[len(c) for c in block.components],
+                        *n_components,
                         len(block.properties),
                         dtype=torch.float64,
                     ),
                     samples=Labels(["center_type"], self.atomic_types.reshape(-1, 1)),
-                    components=block.components,
+                    components=trace_components,
                     properties=block.properties,
                 )
-                for block in layout
-            ],
-        )
-        self.weights[target_name] = TensorMap(
-            layout.keys,
-            blocks=[
+            )
+            weight_blocks.append(
                 TensorBlock(
                     values=torch.zeros(
                         len(self.atomic_types),
-                        *[len(c) for c in block.components],
+                        *n_components,
                         len(block.properties),
                         dtype=torch.float64,
                     ),
                     samples=Labels(["center_type"], self.atomic_types.reshape(-1, 1)),
-                    components=block.components,
+                    components=trace_components,
                     properties=block.properties,
                 )
-                for block in layout
-            ],
-        )
+            )
+
+        self.XTY[target_name] = TensorMap(layout.keys, xty_blocks)
+        self.weights[target_name] = TensorMap(layout.keys, weight_blocks)
 
     def accumulate(
         self,
@@ -263,6 +278,10 @@ class BaseCompositionModel(torch.nn.Module):
 
                 # Get the target block values
                 Y = block.values
+
+                trace_mask = _get_trace_component_mask(block.components)
+                if trace_mask is not None:
+                    Y = Y[:, trace_mask, :]
 
                 # For atomic basis targets, the blocks are already atom-type
                 # conditioned, so we need to slice X and Y to only include the relevant
@@ -486,17 +505,47 @@ class BaseCompositionModel(torch.nn.Module):
                     X_block = X_block[atom_type_mask]
 
                 # Compute X.T @ W
-                out_vals = torch.tensordot(
-                    X_block, weight_block.values, dims=([1], [0])
+                trace_mask = _get_trace_component_mask(weight_block.components)
+
+                if trace_mask is None:
+                    # Standard block - use weights directly
+                    out_vals = torch.tensordot(
+                        X_block, weight_block.values, dims=([1], [0])
                 )
+                    components = weight_block.components
+                
+                else:
+                    out_trace = torch.tensordot(
+                        X_block, weight_block.values, dims = ([1], [0])
+                    )
+                    # Reconstruct full component labels
+                    l = int(weight_block.components[0].values[:, 0].max())
+                    mu_vals = torch.arange(-l, l + 1)
+                    all_mu_pairs = torch.cartesian_prod(mu_vals, mu_vals)
+                    components = [
+                        Labels(names = ["o3_mu_1", "o3_mu_2"], values = all_mu_pairs)
+                    ]
+
+                    # Build full output tensor with zeros, fill trace entries
+                    out_vals = torch.zeros(
+                        X_block.shape[0],
+                        len(all_mu_pairs),
+                        len(weight_block.properties),
+                        dtype=X_block.dtype,
+                        device=X_block.device,
+                    )
+                    full_trace_mask = all_mu_pairs[:, 0] == all_mu_pairs[:, 1]
+                    out_vals[:, full_trace_mask, :] = out_trace
+
                 prediction_blocks.append(
                     TensorBlock(
                         values=out_vals,
                         samples=sample_labels_block,
-                        components=weight_block.components,
-                        properties=weight_block.properties,
+                        components=components,
+                        properties=weight_block.properties
                     )
                 )
+                
                 prediction_key_vals.append(key.values)
 
             prediction = TensorMap(
@@ -597,6 +646,7 @@ def _include_key(key: LabelsEntry) -> bool:
         ["_"],  # scalar
         ["o3_lambda", "o3_sigma"],  # spherical rank 1
         ["o3_lambda", "o3_sigma", "atom_type"],  # atomic basis rank 1
+        ["o3_lambda_1", "o3_lambda_2", "o3_sigma_1", "o3_sigma_2", "atom_type"] # Uncoupled basis
     ]
     include_key = False
 
@@ -609,6 +659,13 @@ def _include_key(key: LabelsEntry) -> bool:
 
     elif key.names == valid_key_names[2]:
         if key["o3_lambda"] == 0 and key["o3_sigma"] == 1:
+            include_key = True
+    
+    elif key.names == valid_key_names[3]:
+        if (
+            key["o3_lambda1"] == key["o3_lambda2"]
+            and key["o3_sigma1"] == key["o3_sigma2"]
+        ):
             include_key = True
 
     else:
@@ -686,3 +743,18 @@ def _get_system_indices_and_labels(
         assume_unique=True,
     )
     return system_indices, sample_labels
+
+def _get_trace_component_mask(components: List[Labels]) -> Optional[torch.Tensor]:
+    """
+    For an uncoupled Hamiltonian block with components Labels(["o3_mu1", "o3_mu2"],
+    ...), returns a boolean mask over the component dimension selecting only the
+    trace entries (mu1 == mu2).
+
+    Returns None if the block is not an uncoupled Hamiltonian block (i.e. doesn't
+    have ["o3_mu1", "o3_mu2"] as component names), indicating all components
+    should be used.
+    """
+    if len(components) == 1 and components[0].names == ["o3_mu1", "o3_mu2"]:
+        comp_vals = components[0].values  # shape (n_components, 2)
+        return comp_vals[:, 0] == comp_vals[:, 1]  # True where mu1 == mu2
+    return None
