@@ -663,8 +663,8 @@ def _include_key(key: LabelsEntry) -> bool:
     
     elif key.names == valid_key_names[3]:
         if (
-            key["o3_lambda1"] == key["o3_lambda2"]
-            and key["o3_sigma1"] == key["o3_sigma2"]
+            key["o3_lambda_1"] == key["o3_lambda_2"]
+            and key["o3_sigma_1"] == key["o3_sigma_2"]
         ):
             include_key = True
 
@@ -754,7 +754,7 @@ def _get_trace_component_mask(components: List[Labels]) -> Optional[torch.Tensor
     have ["o3_mu1", "o3_mu2"] as component names), indicating all components
     should be used.
     """
-    if len(components) == 1 and components[0].names == ["o3_mu1", "o3_mu2"]:
+    if len(components) == 2 and components[0].names == ["o3_mu_1"] and components[1].names == ["o3_mu_2"]:
         comp_vals = components[0].values  # shape (n_components, 2)
         return comp_vals[:, 0] == comp_vals[:, 1]  # True where mu1 == mu2
     return None
