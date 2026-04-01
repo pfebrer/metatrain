@@ -631,7 +631,7 @@ def _include_key(key: LabelsEntry) -> bool:
     
     elif key.names == valid_key_names[3]:
         if (
-            key["o3_lambda_1"] == key["o3_lambda_2"] == 0  # TODO: remove this zero
+            key["o3_lambda_1"] == key["o3_lambda_2"]
             and key["o3_sigma_1"] == key["o3_sigma_2"] == 1
         ):
             include_key = True
