@@ -265,9 +265,9 @@ class BaseCompositionModel(torch.nn.Module):
                 Y = block.values
 
                 if "o3_lambda_1" in key.names:
-                    if key["o3_lambda_1"] != 0:
-                        # take the diagonal over components, where o3_mu_1 == o3_mu_2
-                        Y = torch.diagonal(Y, offset=0, dim1=1, dim2=2).transpose(2, 1)  
+                    if key["o3_lambda_1"] != 0 and key["o3_lambda_1"] == key["o3_lambda_2"]:
+                        # take the trace of the diagonal over components, where o3_mu_1 == o3_mu_2
+                        Y = torch.diagonal(Y, offset=0, dim1=1, dim2=2).sum(dim=-1)
 
                 # For atomic basis targets, the blocks are already atom-type
                 # conditioned, so we need to slice X and Y to only include the relevant
@@ -291,11 +291,12 @@ class BaseCompositionModel(torch.nn.Module):
                     # If this an uncoupled matrix block with l1 == l2 > 0, the scalar
                     # contributions are only computed for diagonals across the component
                     # axes
-                    if key["o3_lambda_1"] != 0:
+                    if key["o3_lambda_1"] != 0 and key["o3_lambda_1"] == key["o3_lambda_2"]:
+                        n_comp = 2 * int(key["o3_lambda_1"]) + 1
                         XTY_expanded = torch.zeros(
-                            XTY.shape[0], XTY.shape[1], XTY.shape[1], XTY.shape[2],
+                            XTY.shape[0], n_comp, n_comp, XTY.shape[1],
                         ).to(dtype=dtype, device=device)
-                        XTY_expanded[:, torch.arange(XTY.shape[1]), torch.arange(XTY.shape[1]), :] = XTY
+                        XTY_expanded[:, torch.arange(n_comp), torch.arange(n_comp), :] = (XTY / n_comp).unsqueeze(1)
                         XTY = XTY_expanded
                     
                 self.XTY[target_name][key].values[:] += XTY
