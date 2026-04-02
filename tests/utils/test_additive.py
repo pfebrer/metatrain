@@ -1288,7 +1288,13 @@ def test_composition_spherical_atomic_basis_rank_2(missing_type):
 
     tensor_map_1 = TensorMap(
         keys=Labels(
-            names=["o3_lambda_1", "o3_lambda_2", "o3_sigma_1", "o3_sigma_2", "atom_type"],
+            names=[
+                "o3_lambda_1",
+                "o3_lambda_2",
+                "o3_sigma_1",
+                "o3_sigma_2",
+                "atom_type",
+            ],
             values=torch.tensor([[0, 0, 1, 1, 8], [1, 1, 1, 1, 8]]),
         ),
         blocks=[
@@ -1305,8 +1311,12 @@ def test_composition_spherical_atomic_basis_rank_2(missing_type):
                 values=pp_full_sys1,
                 samples=Labels(names=["system", "atom"], values=torch.tensor([[0, 0]])),
                 components=[
-                    Labels(names=["o3_mu_1"], values=torch.arange(-1, 2).reshape(-1, 1)),
-                    Labels(names=["o3_mu_2"], values=torch.arange(-1, 2).reshape(-1, 1)),
+                    Labels(
+                        names=["o3_mu_1"], values=torch.arange(-1, 2).reshape(-1, 1)
+                    ),
+                    Labels(
+                        names=["o3_mu_2"], values=torch.arange(-1, 2).reshape(-1, 1)
+                    ),
                 ],
                 properties=Labels(names=["_"], values=torch.tensor([[0]])),
             ),
@@ -1315,10 +1325,14 @@ def test_composition_spherical_atomic_basis_rank_2(missing_type):
 
     tensor_map_2 = TensorMap(
         keys=Labels(
-            names=["o3_lambda_1", "o3_lambda_2", "o3_sigma_1", "o3_sigma_2", "atom_type"],
-            values=torch.tensor(
-                [[0, 0, 1, 1, 1], [0, 0, 1, 1, 8], [1, 1, 1, 1, 8]]
-            ),
+            names=[
+                "o3_lambda_1",
+                "o3_lambda_2",
+                "o3_sigma_1",
+                "o3_sigma_2",
+                "atom_type",
+            ],
+            values=torch.tensor([[0, 0, 1, 1, 1], [0, 0, 1, 1, 8], [1, 1, 1, 1, 8]]),
         ),
         blocks=[
             TensorBlock(
@@ -1352,8 +1366,12 @@ def test_composition_spherical_atomic_basis_rank_2(missing_type):
                     values=torch.tensor([[1, 2]]),
                 ),
                 components=[
-                    Labels(names=["o3_mu_1"], values=torch.arange(-1, 2).reshape(-1, 1)),
-                    Labels(names=["o3_mu_2"], values=torch.arange(-1, 2).reshape(-1, 1)),
+                    Labels(
+                        names=["o3_mu_1"], values=torch.arange(-1, 2).reshape(-1, 1)
+                    ),
+                    Labels(
+                        names=["o3_mu_2"], values=torch.arange(-1, 2).reshape(-1, 1)
+                    ),
                 ],
                 properties=Labels(names=["_"], values=torch.tensor([[0]])),
             ),
@@ -1401,9 +1419,7 @@ def test_composition_spherical_atomic_basis_rank_2(missing_type):
         ),
     )
 
-    composition_model.train_model(
-        [dataset], [], batch_size=1, is_distributed=False
-    )
+    composition_model.train_model([dataset], [], batch_size=1, is_distributed=False)
     assert composition_model.atomic_types == atomic_types
 
     output = composition_model(
@@ -1442,9 +1458,7 @@ def test_composition_spherical_atomic_basis_rank_2(missing_type):
         output_F = composition_model(
             [system_F], {"uncoupled_hamiltonian": ModelOutput(per_atom=True)}
         )
-        F_ss_block = output_F["uncoupled_hamiltonian"].block(
-            {**ss_key, "atom_type": 9}
-        )
+        F_ss_block = output_F["uncoupled_hamiltonian"].block({**ss_key, "atom_type": 9})
         torch.testing.assert_close(
             F_ss_block.values,
             torch.tensor([0.0], dtype=torch.float64).reshape(-1, 1, 1, 1),
