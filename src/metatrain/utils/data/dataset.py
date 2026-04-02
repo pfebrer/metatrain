@@ -791,7 +791,8 @@ class DiskDataset(torch.utils.data.Dataset):
                 if (
                     isinstance(target.get("type"), (dict, DictConfig))
                     and "spherical" in target["type"]
-                    and target["type"]["spherical"].get("product") in ["coupled", "cartesian"]
+                    and target["type"]["spherical"].get("product")
+                    in ["coupled", "cartesian"]
                 ):
                     non_type_indices = [
                         i

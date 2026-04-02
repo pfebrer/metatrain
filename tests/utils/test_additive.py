@@ -1041,7 +1041,7 @@ def test_composition_spherical():
 
 
 @pytest.mark.parametrize("missing_type", [False, True])
-def test_composition_spherical_atomicbasis(missing_type):
+def test_composition_spherical_atomic_basis(missing_type):
     """Test the calculation of composition weights for a spherical
     target that is on an atomic basis (and per atom).
 
@@ -1230,3 +1230,241 @@ def test_composition_spherical_atomicbasis(missing_type):
         torch.testing.assert_close(
             F_block.values, torch.tensor([0.0], dtype=torch.float64).reshape(-1, 1, 1)
         )
+
+
+def test_composition_spherical_per_atom_rank_2():
+    """
+    Test the calculation of composition weights for a spherical per-atom rank 2 target
+    (keys: o3_lambda_1, o3_sigma_1, o3_lambda_2, o3_sigma_2) is correct.
+    """
+    # TODO!
+    raise NotImplementedError
+
+
+def test_composition_spherical_per_atom_rank_2_rotation_invariance():
+    """
+    Test the calculation of composition weights for a spherical per-atom rank 2 target
+    (keys: o3_lambda_1, o3_sigma_1, o3_lambda_2, o3_sigma_2) is invariant under fitting
+    on a rotated version of the dataset.
+    """
+    # TODO!
+    raise NotImplementedError
+
+
+@pytest.mark.parametrize("missing_type", [False, True])
+def test_composition_spherical_atomic_basis_rank_2(missing_type):
+    """
+    Test the calculation of composition weights for a spherical per-atom rank 2 atomic
+    basis target (keys: o3_lambda_1, o3_sigma_1, o3_lambda_2, o3_sigma_2, atom_type) is
+    correct.
+    """
+
+    systems = [
+        System(
+            positions=torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float64),
+            types=torch.tensor([8]),
+            cell=torch.eye(3, dtype=torch.float64),
+            pbc=torch.tensor([True, True, True]),
+        ),
+        System(
+            positions=torch.tensor(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=torch.float64,
+            ),
+            types=torch.tensor([1, 1, 8]),
+            cell=torch.eye(3, dtype=torch.float64),
+            pbc=torch.tensor([True, True, True]),
+        ),
+    ]
+
+    tensor_map_1 = TensorMap(
+        keys=Labels(
+            names=[
+                "o3_lambda_1",
+                "o3_sigma_1",
+                "o3_lambda_2",
+                "o3_sigma_2",
+                "atom_type",
+            ],
+            values=torch.tensor(
+                [
+                    [0, 1, 0, 1, 8],
+                    [0, 1, 1, 1, 8],
+                ]
+            ),
+        ),
+        blocks=[
+            TensorBlock(
+                values=torch.tensor([[1.0]], dtype=torch.float64).reshape(-1, 1, 1, 1),
+                samples=Labels(names=["system", "atom"], values=torch.tensor([[0, 0]])),
+                components=[
+                    Labels(names=["o3_mu_1"], values=torch.tensor([[0]])),
+                    Labels(names=["o3_mu_2"], values=torch.tensor([[0]])),
+                ],
+                properties=Labels(names=["_"], values=torch.tensor([[0]])),
+            ),
+            TensorBlock(
+                values=torch.randn((1, 1, 3, 1), dtype=torch.float64),
+                samples=Labels(names=["system", "atom"], values=torch.tensor([[0, 0]])),
+                components=[
+                    Labels(names=["o3_mu_1"], values=torch.tensor([[0]])),
+                    Labels(
+                        names=["o3_mu_2"], values=torch.arange(-1, 2).reshape(-1, 1)
+                    ),
+                ],
+                properties=Labels(names=["_"], values=torch.tensor([[0]])),
+            ),
+        ],
+    )
+
+    tensor_map_2 = TensorMap(
+        keys=Labels(
+            names=[
+                "o3_lambda_1",
+                "o3_sigma_1",
+                "o3_lambda_2",
+                "o3_sigma_2",
+                "atom_type",
+            ],
+            values=torch.tensor(
+                [
+                    [0, 1, 0, 1, 1],
+                    [0, 1, 0, 1, 8],
+                    [0, 1, 1, 1, 8],
+                ]
+            ),
+        ),
+        blocks=[
+            TensorBlock(
+                values=torch.tensor([[1.0], [1.5]], dtype=torch.float64).reshape(
+                    -1, 1, 1, 1
+                ),
+                samples=Labels(
+                    names=["system", "atom"],
+                    values=torch.tensor([[1, 0], [1, 1]]),
+                ),
+                components=[
+                    Labels(names=["o3_mu_1"], values=torch.tensor([[0]])),
+                    Labels(names=["o3_mu_2"], values=torch.tensor([[0]])),
+                ],
+                properties=Labels(names=["_"], values=torch.tensor([[0]])),
+            ),
+            TensorBlock(
+                values=torch.tensor([[2.0]], dtype=torch.float64).reshape(-1, 1, 1, 1),
+                samples=Labels(
+                    names=["system", "atom"],
+                    values=torch.tensor([[1, 2]]),
+                ),
+                components=[
+                    Labels(names=["o3_mu_1"], values=torch.tensor([[0]])),
+                    Labels(names=["o3_mu_2"], values=torch.tensor([[0]])),
+                ],
+                properties=Labels(names=["_"], values=torch.tensor([[0]])),
+            ),
+            TensorBlock(
+                values=torch.randn((1, 1, 3, 1), dtype=torch.float64),
+                samples=Labels(
+                    names=["system", "atom"],
+                    values=torch.tensor([[1, 2]]),
+                ),
+                components=[
+                    Labels(names=["o3_mu_1"], values=torch.tensor([[0]])),
+                    Labels(
+                        names=["o3_mu_2"], values=torch.arange(-1, 2).reshape(-1, 1)
+                    ),
+                ],
+                properties=Labels(names=["_"], values=torch.tensor([[0]])),
+            ),
+        ],
+    )
+
+    dataset = Dataset.from_dict(
+        {
+            "system": systems,
+            "uncoupled_atomic_basis": [tensor_map_1, tensor_map_2],
+        }
+    )
+
+    atomic_types = [1, 8]
+    irreps = {
+        1: [
+            {"o3_lambda": 0, "o3_sigma": 1},
+        ],
+        8: [
+            {"o3_lambda": 0, "o3_sigma": 1},
+            {"o3_lambda": 1, "o3_sigma": 1},
+        ],
+    }
+    if missing_type:
+        atomic_types.append(9)
+        irreps[9] = [
+            {"o3_lambda": 0, "o3_sigma": 1},
+        ]
+
+    composition_model = CompositionModel(
+        hypers={},
+        dataset_info=DatasetInfo(
+            length_unit="angstrom",
+            atomic_types=atomic_types,
+            targets={
+                "uncoupled_atomic_basis": get_generic_target_info(
+                    "uncoupled_atomic_basis",
+                    {
+                        "quantity": "",
+                        "unit": "",
+                        "type": {
+                            "spherical": {"irreps": irreps, "product": "cartesian"}
+                        },
+                        "num_subtargets": 1,
+                        "per_atom": True,
+                    },
+                )
+            },
+        ),
+    )
+
+    composition_model.train_model([dataset], [], batch_size=1, is_distributed=False)
+    assert composition_model.atomic_types == atomic_types
+
+    output = composition_model(
+        [systems[1]], {"uncoupled_atomic_basis": ModelOutput(per_atom=True)}
+    )
+
+    H_block = output["uncoupled_atomic_basis"].block({"atom_type": 1})
+    O_block = output["uncoupled_atomic_basis"].block({"atom_type": 8})
+
+    torch.testing.assert_close(
+        H_block.values,
+        torch.tensor([1.25, 1.25], dtype=torch.float64).reshape(-1, 1, 1, 1),
+    )
+    torch.testing.assert_close(
+        O_block.values,
+        torch.tensor([1.5], dtype=torch.float64).reshape(-1, 1, 1, 1),
+    )
+
+    if missing_type:
+        system_F = System(
+            positions=torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float64),
+            types=torch.tensor([9]),
+            cell=torch.eye(3, dtype=torch.float64),
+            pbc=torch.tensor([True, True, True]),
+        )
+        output_F = composition_model(
+            [system_F], {"uncoupled_atomic_basis": ModelOutput(per_atom=True)}
+        )
+        F_block = output_F["uncoupled_atomic_basis"].block({"atom_type": 9})
+        torch.testing.assert_close(
+            F_block.values,
+            torch.tensor([0.0], dtype=torch.float64).reshape(-1, 1, 1, 1),
+        )
+
+
+@pytest.mark.parametrize("missing_type", [False, True])
+def test_composition_spherical_atomic_basis_rank_2_rotation_invariance(missing_type):
+    """
+    Test the calculation of composition weights for a spherical per-atom rank 2 atomic
+    basis target (keys: o3_lambda_1, o3_sigma_1, o3_lambda_2, o3_sigma_2, atom_type) is
+    invariant under fitting on a rotated version of the dataset.
+    """
+    # TODO!
+    raise NotImplementedError
