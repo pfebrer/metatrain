@@ -263,6 +263,13 @@ class BaseCompositionModel(torch.nn.Module):
 
                 # Get the target block values
                 Y = block.values
+                if "o3_lambda_1" in key.names:
+                    # For rank 2 tensors, we fit only their invariant part (the trace).
+                    # Get the trace for each (sample, property)
+                    traces = torch.diagonal(Y, dim1=1, dim2=2).mean(dim=-1)
+                    # Recreate the blocks with only the invariant contribution.
+                    Id = torch.eye(Y.shape[1], dtype=dtype, device=device)
+                    Y = torch.einsum("sp,ij->sijp", traces, Id)
 
                 # For atomic basis targets, the blocks are already atom-type
                 # conditioned, so we need to slice X and Y to only include the relevant
@@ -280,30 +287,9 @@ class BaseCompositionModel(torch.nn.Module):
                 self.XTX[target_name][key].values[:] += X_.T @ X_
 
                 # Compute "XTY", i.e. X.T @ Y
-                if "o3_lambda_1" in key.names:
-                    # for uncoupled matrices, take the mean of the diagonal over
-                    # components, where o3_mu_1 == o3_mu_2
-                    Y = (
-                        torch.diagonal(Y, offset=0, dim1=1, dim2=2)
-                        .mean(dim=-1)
-                        .unsqueeze(1)
-                    )
-                    XTY = torch.tensordot(X_, Y, dims=([0], [0]))
-
-                    n_comp = 2 * int(key["o3_lambda_1"]) + 1
-                    XTY_expanded = torch.zeros(
-                        XTY.shape[0],
-                        n_comp,
-                        n_comp,
-                        XTY.shape[1],
-                    ).to(dtype=dtype, device=device)
-                    XTY_expanded[:, torch.arange(n_comp), torch.arange(n_comp), :] = XTY
-                    XTY = XTY_expanded
-
-                else:
-                    XTY = torch.tensordot(X_, Y, dims=([0], [0]))
-
-                self.XTY[target_name][key].values[:] += XTY
+                self.XTY[target_name][key].values[:] += torch.tensordot(
+                    X_, Y, dims=([0], [0])
+                )
 
     def _sanitize_fixed_weights(
         self,
@@ -510,7 +496,6 @@ class BaseCompositionModel(torch.nn.Module):
                 out_vals = torch.tensordot(
                     X_block, weight_block.values, dims=([1], [0])
                 )
-
                 prediction_blocks.append(
                     TensorBlock(
                         values=out_vals,
