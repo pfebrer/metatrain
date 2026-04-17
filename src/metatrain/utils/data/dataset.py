@@ -472,11 +472,17 @@ class CollateFn:
             else:
                 extra[key] = value
 
+        store: Dict[str, TensorMap] = {}
+
         for callable in self.callables:
-            systems, targets, extra = callable(systems, targets, extra)
+            try:
+                systems, targets, extra, store = callable(systems, targets, extra, store)
+            except Exception as e:
+                systems, targets, extra = callable(systems, targets, extra)
 
         target_names = list(targets.keys())
         extra_names = list(extra.keys())
+        store_names = list(store.keys())
 
         system_buffers = [
             save_system_buffer(_make_system_contiguous(s)) for s in systems
@@ -487,18 +493,23 @@ class CollateFn:
         extra_buffers = [
             save_buffer(make_contiguous(extra[name])) for name in extra_names
         ]
+        store_buffers = [
+            save_buffer(make_contiguous(store[name])) for name in store.keys()
+        ]
 
         system_sizes = [len(b) for b in system_buffers]
         target_sizes = [len(b) for b in target_buffers]
         extra_sizes = [len(b) for b in extra_buffers]
+        store_sizes = [len(b) for b in store_buffers]
 
-        blob = torch.concatenate(system_buffers + target_buffers + extra_buffers)
+        blob = torch.concatenate(system_buffers + target_buffers + extra_buffers + store_buffers)
 
-        return blob, system_sizes, target_names, target_sizes, extra_names, extra_sizes
+        return blob, system_sizes, target_names, target_sizes, extra_names, extra_sizes, store_names, store_sizes
 
 
 def unpack_batch(
     batch: Any,
+    with_store: bool = False,
 ) -> Tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap]]:
     """
     Unpacks a batch into its constituent parts.
@@ -506,9 +517,9 @@ def unpack_batch(
     :param batch: The batch to unpack.
     :return: A tuple with the unpacked batch
     """
-    blob, system_sizes, target_names, target_sizes, extra_names, extra_sizes = batch
+    blob, system_sizes, target_names, target_sizes, extra_names, extra_sizes, store_names, store_sizes = batch
 
-    all_buffers = torch.split(blob, system_sizes + target_sizes + extra_sizes)
+    all_buffers = torch.split(blob, system_sizes + target_sizes + extra_sizes + store_sizes)
     systems = all_buffers[: len(system_sizes)]
     targets = {
         name: buf
@@ -522,7 +533,15 @@ def unpack_batch(
         name: buf
         for name, buf in zip(
             extra_names,
-            all_buffers[len(system_sizes) + len(target_names) :],
+            all_buffers[len(system_sizes) + len(target_names) : len(system_sizes) + len(target_names) + len(extra_names)],
+            strict=True,
+        )
+    }
+    store = {
+        name: buf
+        for name, buf in zip(
+            store_names,
+            all_buffers[len(system_sizes) + len(target_names) + len(extra_names) :],
             strict=True,
         )
     }
@@ -530,6 +549,9 @@ def unpack_batch(
     systems = list(load_system_buffer(s) for s in systems)
     targets = {key: load_buffer(t) for key, t in targets.items()}
     extra_data = {key: load_buffer(t) for key, t in extra_data.items()}
+    store = {key: load_buffer(t) for key, t in store.items()}
+    if with_store:
+        return systems, targets, extra_data, store
     return systems, targets, extra_data
 
 

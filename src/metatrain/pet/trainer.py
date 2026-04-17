@@ -233,10 +233,28 @@ class Trainer(TrainerInterface[TrainerHypers]):
         atomic_basis_transform, atomic_basis_reverse_transform = (
             get_prepare_atomic_basis_targets_transform(train_targets, extra_data_info)
         )
+
+        from metatensor.torch import TensorMap
+        from metatomic.torch import System
+
+        def pre_transform_targets(
+            systems: List[System],
+            targets: Dict[str, TensorMap],
+            extra: Dict[str, TensorMap],
+            store: Dict[str, TensorMap],
+        ) -> tuple[List[System], Dict[str, TensorMap], Dict[str, TensorMap], Dict[str, TensorMap]]:
+
+            for target_name, value in targets.items():
+                store[f"pre-transform::{target_name}"] = value
+            for extra_name, value in extra.items():
+                store[f"pre-transform::{extra_name}"] = value
+            return systems, targets, extra, store
+
         collate_fn_train = CollateFn(
             target_keys=list(train_targets.keys()),
             callables=[
                 get_remove_additive_transform(additive_models, train_targets),
+                pre_transform_targets,
                 get_remove_scale_transform(scaler),
                 atomic_basis_transform,
                 rotational_augmenter.apply_random_augmentations,
@@ -404,10 +422,14 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
                         optimizer.zero_grad()
 
-                        systems, targets, extra_data = unpack_batch(batch)
+                        systems, targets, extra_data, store = unpack_batch(batch, with_store=True)
                         systems, targets, extra_data = batch_to(
                             systems, targets, extra_data, dtype=dtype, device=device
                         )
+                        store = {
+                            key: value.to(dtype=dtype, device=device)
+                            for key, value in store.items()
+                        }
                     with torch.profiler.record_function("PET::run-model"):
                         predictions = evaluate_model(
                             model,
@@ -446,9 +468,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     with torch.profiler.record_function("PET::reverse-transform"):
                         # if any atomic basis outputs are present, reverse the transform
                         # before calculating metrics
-                        systems, targets, extra_data = atomic_basis_reverse_transform(
-                            systems, targets, extra_data
-                        )
+                        # systems, targets, extra_data = atomic_basis_reverse_transform(
+                        #     systems, targets, extra_data
+                        # )
                         systems, predictions, _ = atomic_basis_reverse_transform(
                             systems, predictions, {}
                         )
@@ -458,9 +480,20 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         scaled_predictions = (model.module if is_distributed else model).scaler(
                             systems, predictions
                         )
-                        scaled_targets = (model.module if is_distributed else model).scaler(
-                            systems, targets
-                        )
+                        # scaled_targets = (model.module if is_distributed else model).scaler(
+                        #     systems, targets
+                        # )
+
+                    scaled_targets = {
+                        target_name: store[f"pre-transform::{target_name}"]
+                        for target_name in targets.keys()
+                    }
+                    extra_data = {
+                        extra_name: store[f"pre-transform::{extra_name}"]
+                        for extra_name in extra_data.keys()
+                    }
+
+                    print(list(scaled_targets))
 
                     with torch.profiler.record_function("PET::update-metrics"):
                         train_rmse_calculator.update(
@@ -470,7 +503,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             train_mae_calculator.update(
                                 scaled_predictions, scaled_targets, extra_data
                             )
-                    if i == 5:
+                    if i == 0:
                         break
 
             prof.export_chrome_trace("trace.json")
