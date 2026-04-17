@@ -396,7 +396,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             train_loss = 0.0
             for batch in train_dataloader:
                 with torch.profiler.profile(activities=activities) as prof:
-                    with torch.profiler.record_function("PET::run-model"):
+                    with torch.profiler.record_function("PET::prepare-batch"):
                         # Skip None batches (those outside batch_atom_bounds)
                         if should_skip_batch(batch, is_distributed, device):
                             continue
@@ -407,12 +407,14 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         systems, targets, extra_data = batch_to(
                             systems, targets, extra_data, dtype=dtype, device=device
                         )
+                    with torch.profiler.record_function("PET::run-model"):
                         predictions = evaluate_model(
                             model,
                             systems,
                             {key: train_targets[key] for key in targets.keys()},
                             is_training=True,
                         )
+                    with torch.profiler.record_function("PET::compute-loss"):
 
                         # average by the number of atoms
                         predictions = average_by_num_atoms(
@@ -427,6 +429,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             for param in model.parameters():
                                 train_loss_batch += 0.0 * param.sum()
 
+                    with torch.profiler.record_function("PET::optim-step"):
                         train_loss_batch.backward()
                         torch.nn.utils.clip_grad_norm_(
                             model.parameters(), self.hypers["grad_clip_norm"]
