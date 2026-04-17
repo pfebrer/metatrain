@@ -430,6 +430,7 @@ def _sparsify_per_atom_atomic_basis_target(
             # can happen if this atom type isn't present in the batch
             assert not torch.any(unique_types == key["atom_type"])
             continue
+        assert block is not None
         present.append(
             (
                 key_idx,
