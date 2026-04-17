@@ -393,9 +393,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 )
                 val_mae_calculator = MAEAccumulator(self.hypers["log_separate_blocks"])
 
-            train_loss = 0.0
-            for batch in train_dataloader:
-                with torch.profiler.profile(activities=activities) as prof:
+            with torch.profiler.profile(activities=activities) as prof:
+                train_loss = 0.0
+                for i, batch in enumerate(train_dataloader):
+                    
                     with torch.profiler.record_function("PET::prepare-batch"):
                         # Skip None batches (those outside batch_atom_bounds)
                         if should_skip_batch(batch, is_distributed, device):
@@ -469,9 +470,11 @@ class Trainer(TrainerInterface[TrainerHypers]):
                             train_mae_calculator.update(
                                 scaled_predictions, scaled_targets, extra_data
                             )
-                print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
-                prof.export_chrome_trace("trace.json")
-                exit()
+                    if i == 5:
+                        break
+
+            prof.export_chrome_trace("trace.json")
+            exit()
 
             finalized_train_info = train_rmse_calculator.finalize(
                 not_per_atom=["positions_gradients"] + per_structure_targets,
