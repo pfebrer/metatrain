@@ -373,6 +373,14 @@ class Trainer(TrainerInterface[TrainerHypers]):
         logging.info("Starting training")
         epoch = start_epoch
 
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            device = "cuda"
+            activities += [torch.profiler.ProfilerActivity.CUDA]
+        elif torch.xpu.is_available():
+            device = "xpu"
+            activities += [torch.profiler.ProfilerActivity.XPU]
+        
         for epoch in range(start_epoch, self.hypers["num_epochs"]):
             if is_distributed:
                 for train_sampler in train_samplers:
@@ -387,70 +395,80 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
             train_loss = 0.0
             for batch in train_dataloader:
-                # Skip None batches (those outside batch_atom_bounds)
-                if should_skip_batch(batch, is_distributed, device):
-                    continue
+                with torch.profiler.profile(activities=activities) as prof:
+                    with torch.profiler.record_function("PET::run-model"):
+                        # Skip None batches (those outside batch_atom_bounds)
+                        if should_skip_batch(batch, is_distributed, device):
+                            continue
 
-                optimizer.zero_grad()
+                        optimizer.zero_grad()
 
-                systems, targets, extra_data = unpack_batch(batch)
-                systems, targets, extra_data = batch_to(
-                    systems, targets, extra_data, dtype=dtype, device=device
-                )
-                predictions = evaluate_model(
-                    model,
-                    systems,
-                    {key: train_targets[key] for key in targets.keys()},
-                    is_training=True,
-                )
+                        systems, targets, extra_data = unpack_batch(batch)
+                        systems, targets, extra_data = batch_to(
+                            systems, targets, extra_data, dtype=dtype, device=device
+                        )
+                        predictions = evaluate_model(
+                            model,
+                            systems,
+                            {key: train_targets[key] for key in targets.keys()},
+                            is_training=True,
+                        )
 
-                # average by the number of atoms
-                predictions = average_by_num_atoms(
-                    predictions, systems, per_structure_targets
-                )
-                targets = average_by_num_atoms(targets, systems, per_structure_targets)
-                train_loss_batch = loss_fn(predictions, targets, extra_data)
+                        # average by the number of atoms
+                        predictions = average_by_num_atoms(
+                            predictions, systems, per_structure_targets
+                        )
+                        targets = average_by_num_atoms(targets, systems, per_structure_targets)
+                        train_loss_batch = loss_fn(predictions, targets, extra_data)
 
-                if is_distributed:
-                    # make sure all parameters contribute to the gradient calculation
-                    # to make torch DDP happy
-                    for param in model.parameters():
-                        train_loss_batch += 0.0 * param.sum()
+                        if is_distributed:
+                            # make sure all parameters contribute to the gradient calculation
+                            # to make torch DDP happy
+                            for param in model.parameters():
+                                train_loss_batch += 0.0 * param.sum()
 
-                train_loss_batch.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), self.hypers["grad_clip_norm"]
-                )
-                optimizer.step()
-                lr_scheduler.step()
+                        train_loss_batch.backward()
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), self.hypers["grad_clip_norm"]
+                        )
+                        optimizer.step()
+                        lr_scheduler.step()
 
-                if is_distributed:
-                    # sum the loss over all processes
-                    torch.distributed.all_reduce(train_loss_batch)
-                train_loss += train_loss_batch.item()
+                        if is_distributed:
+                            # sum the loss over all processes
+                            torch.distributed.all_reduce(train_loss_batch)
+                        train_loss += train_loss_batch.item()
 
-                # if any atomic basis outputs are present, reverse the transform
-                # before calculating metrics
-                systems, targets, extra_data = atomic_basis_reverse_transform(
-                    systems, targets, extra_data
-                )
-                systems, predictions, _ = atomic_basis_reverse_transform(
-                    systems, predictions, {}
-                )
+                    with torch.profiler.record_function("PET::reverse-transform"):
+                        # if any atomic basis outputs are present, reverse the transform
+                        # before calculating metrics
+                        systems, targets, extra_data = atomic_basis_reverse_transform(
+                            systems, targets, extra_data
+                        )
+                        systems, predictions, _ = atomic_basis_reverse_transform(
+                            systems, predictions, {}
+                        )
 
-                scaled_predictions = (model.module if is_distributed else model).scaler(
-                    systems, predictions
-                )
-                scaled_targets = (model.module if is_distributed else model).scaler(
-                    systems, targets
-                )
-                train_rmse_calculator.update(
-                    scaled_predictions, scaled_targets, extra_data
-                )
-                if self.hypers["log_mae"]:
-                    train_mae_calculator.update(
-                        scaled_predictions, scaled_targets, extra_data
-                    )
+                    with torch.profiler.record_function("PET::scale"):
+
+                        scaled_predictions = (model.module if is_distributed else model).scaler(
+                            systems, predictions
+                        )
+                        scaled_targets = (model.module if is_distributed else model).scaler(
+                            systems, targets
+                        )
+
+                    with torch.profiler.record_function("PET::update-metrics"):
+                        train_rmse_calculator.update(
+                            scaled_predictions, scaled_targets, extra_data
+                        )
+                        if self.hypers["log_mae"]:
+                            train_mae_calculator.update(
+                                scaled_predictions, scaled_targets, extra_data
+                            )
+                print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
+                prof.export_chrome_trace("trace.json")
+                exit()
 
             finalized_train_info = train_rmse_calculator.finalize(
                 not_per_atom=["positions_gradients"] + per_structure_targets,
