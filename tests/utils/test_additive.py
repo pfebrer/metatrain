@@ -2496,3 +2496,242 @@ def test_composition_spherical_atomic_basis_rank_2_rotation_invariance(missing_t
         weights_rot.block({**pp_key, "atom_type": 8}).values,
         equal_nan=True,
     )
+
+
+@pytest.mark.parametrize("missing_type", [False, True])
+def test_composition_spherical_atom_pair_atomic_basis(missing_type):
+    """Test composition weights for a spherical atomic-basis per-atom-pair target.
+
+    We use two small synthetic structures, each containing one H atom (Z=1) and one
+    C atom (Z=6).  Only H→C and C→H pair data are provided; H→H and C→C pairs are
+    absent so their weights should be zero.
+
+    With atomic_types=[1, 6]:
+      type_pair_to_index ordering: (1,1)→0, (1,6)→1, (6,1)→2, (6,6)→3
+
+    Training data (L=0 scalar value per pair):
+      System 0: H→C = 2.0, C→H = 3.0
+      System 1: H→C = 5.0, C→H = 7.0
+
+    Expected composition weights (mean per type pair, solved from diagonal XTX):
+      w(1,6) = (2.0 + 5.0) / 2 = 3.5   (H→C)
+      w(6,1) = (3.0 + 7.0) / 2 = 5.0   (C→H)
+      w(1,1) = w(6,6) = 0.0             (no data → XTX=0 → weight=0)
+
+    :param missing_type: whether to add an atomic type (Z=9, F) absent from the
+        training data, to verify it is handled gracefully.
+    """
+    from metatomic.torch import NeighborListOptions
+
+    systems = [
+        System(
+            positions=torch.tensor(
+                [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]], dtype=torch.float64
+            ),
+            types=torch.tensor([1, 6]),  # atom 0 = H, atom 1 = C
+            cell=torch.zeros(3, 3, dtype=torch.float64),
+            pbc=torch.tensor([False, False, False]),
+        ),
+        System(
+            positions=torch.tensor(
+                [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]], dtype=torch.float64
+            ),
+            types=torch.tensor([1, 6]),  # atom 0 = H, atom 1 = C
+            cell=torch.zeros(3, 3, dtype=torch.float64),
+            pbc=torch.tensor([False, False, False]),
+        ),
+    ]
+
+    def make_tensor_map(system_idx, hc_val, ch_val):
+        """Build a sparse TensorMap with only the H→C and C→H pair blocks."""
+        return TensorMap(
+            keys=Labels(
+                names=[
+                    "o3_lambda",
+                    "o3_sigma",
+                    "first_atom_type",
+                    "second_atom_type",
+                ],
+                values=torch.tensor([[0, 1, 1, 6], [0, 1, 6, 1]]),
+            ),
+            blocks=[
+                TensorBlock(
+                    # H→C edge: first_atom=0 (H), second_atom=1 (C)
+                    values=torch.tensor([[hc_val]], dtype=torch.float64).reshape(
+                        -1, 1, 1
+                    ),
+                    samples=Labels(
+                        names=[
+                            "system",
+                            "first_atom",
+                            "second_atom",
+                            "cell_shift_a",
+                            "cell_shift_b",
+                            "cell_shift_c",
+                        ],
+                        values=torch.tensor([[system_idx, 0, 1, 0, 0, 0]]),
+                    ),
+                    components=[Labels(names=["o3_mu"], values=torch.tensor([[0]]))],
+                    properties=Labels(names=["_"], values=torch.tensor([[0]])),
+                ),
+                TensorBlock(
+                    # C→H edge: first_atom=1 (C), second_atom=0 (H)
+                    values=torch.tensor([[ch_val]], dtype=torch.float64).reshape(
+                        -1, 1, 1
+                    ),
+                    samples=Labels(
+                        names=[
+                            "system",
+                            "first_atom",
+                            "second_atom",
+                            "cell_shift_a",
+                            "cell_shift_b",
+                            "cell_shift_c",
+                        ],
+                        values=torch.tensor([[system_idx, 1, 0, 0, 0, 0]]),
+                    ),
+                    components=[Labels(names=["o3_mu"], values=torch.tensor([[0]]))],
+                    properties=Labels(names=["_"], values=torch.tensor([[0]])),
+                ),
+            ],
+        )
+
+    dataset = Dataset.from_dict(
+        {
+            "system": systems,
+            "pair_basis": [
+                make_tensor_map(0, 2.0, 3.0),
+                make_tensor_map(1, 5.0, 7.0),
+            ],
+        }
+    )
+
+    atomic_types = [1, 6]
+    irreps = {
+        1: [{"o3_lambda": 0, "o3_sigma": 1}],
+        6: [{"o3_lambda": 0, "o3_sigma": 1}],
+    }
+    if missing_type:
+        atomic_types.append(9)
+        irreps[9] = [{"o3_lambda": 0, "o3_sigma": 1}]
+
+    composition_model = CompositionModel(
+        hypers={},
+        dataset_info=DatasetInfo(
+            length_unit="angstrom",
+            atomic_types=atomic_types,
+            targets={
+                "pair_basis": get_generic_target_info(
+                    "pair_basis",
+                    {
+                        "quantity": "",
+                        "unit": "",
+                        "type": {"spherical": {"irreps": irreps, "product": "coupled"}},
+                        "num_subtargets": 1,
+                        "sample_kind": "atom_pair",
+                    },
+                )
+            },
+        ),
+    )
+
+    composition_model.train_model([dataset], [], batch_size=1, is_distributed=False)
+    assert composition_model.atomic_types == atomic_types
+
+    # ------------------------------------------------------------------ #
+    # Check the fitted weights directly.                                   #
+    # Each key block stores weight rows for every type pair in            #
+    # pair_samples order.  Row flat_idx = type_pair_to_index[Z1, Z2].    #
+    # ------------------------------------------------------------------ #
+    weights = composition_model.model.weights["pair_basis"]
+    idx_hc = composition_model.model.type_pair_to_index[1, 6].item()
+    idx_ch = composition_model.model.type_pair_to_index[6, 1].item()
+
+    hc_block = weights.block(
+        {"o3_lambda": 0, "o3_sigma": 1, "first_atom_type": 1, "second_atom_type": 6}
+    )
+    ch_block = weights.block(
+        {"o3_lambda": 0, "o3_sigma": 1, "first_atom_type": 6, "second_atom_type": 1}
+    )
+    hh_block = weights.block(
+        {"o3_lambda": 0, "o3_sigma": 1, "first_atom_type": 1, "second_atom_type": 1}
+    )
+    cc_block = weights.block(
+        {"o3_lambda": 0, "o3_sigma": 1, "first_atom_type": 6, "second_atom_type": 6}
+    )
+
+    # H→C key block: row idx_hc holds the mean of the two H→C training values.
+    torch.testing.assert_close(
+        hc_block.values[idx_hc, 0, 0],
+        torch.tensor(3.5, dtype=torch.float64),
+    )
+    # C→H key block: row idx_ch holds the mean of the two C→H training values.
+    torch.testing.assert_close(
+        ch_block.values[idx_ch, 0, 0],
+        torch.tensor(5.0, dtype=torch.float64),
+    )
+    # H→H and C→C key blocks: no training data, so XTX=0 → weights set to zero.
+    torch.testing.assert_close(hh_block.values, torch.zeros_like(hh_block.values))
+    torch.testing.assert_close(cc_block.values, torch.zeros_like(cc_block.values))
+
+    # ------------------------------------------------------------------ #
+    # Check the forward pass (requires a neighbor list on the systems).   #
+    # ------------------------------------------------------------------ #
+    nl_options = NeighborListOptions(cutoff=2.0, full_list=True, strict=True)
+    systems_with_nl = [get_system_with_neighbor_lists(s, [nl_options]) for s in systems]
+
+    output = composition_model(
+        [systems_with_nl[0]],
+        {"pair_basis": ModelOutput(sample_kind="atom_pair")},
+    )
+    # System 0 has one H→C edge and one C→H edge (full neighbor list).
+    # The predicted value for each edge equals the fitted weight for that type pair.
+    hc_out = output["pair_basis"].block(
+        {"o3_lambda": 0, "o3_sigma": 1, "first_atom_type": 1, "second_atom_type": 6}
+    )
+    ch_out = output["pair_basis"].block(
+        {"o3_lambda": 0, "o3_sigma": 1, "first_atom_type": 6, "second_atom_type": 1}
+    )
+    torch.testing.assert_close(
+        hc_out.values,
+        torch.tensor([3.5], dtype=torch.float64).reshape(-1, 1, 1),
+    )
+    torch.testing.assert_close(
+        ch_out.values,
+        torch.tensor([5.0], dtype=torch.float64).reshape(-1, 1, 1),
+    )
+
+    if missing_type:
+        # A system with the missing type (Z=9, F) should run without error.
+        # H→F and F→H weights are zero since no training data was seen.
+        system_hf = System(
+            positions=torch.tensor(
+                [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]], dtype=torch.float64
+            ),
+            types=torch.tensor([1, 9]),  # H, F
+            cell=torch.zeros(3, 3, dtype=torch.float64),
+            pbc=torch.tensor([False, False, False]),
+        )
+        system_hf = get_system_with_neighbor_lists(system_hf, [nl_options])
+        output_hf = composition_model(
+            [system_hf],
+            {"pair_basis": ModelOutput(sample_kind="atom_pair")},
+        )
+        hf_out = output_hf["pair_basis"].block(
+            {
+                "o3_lambda": 0,
+                "o3_sigma": 1,
+                "first_atom_type": 1,
+                "second_atom_type": 9,
+            }
+        )
+        fh_out = output_hf["pair_basis"].block(
+            {
+                "o3_lambda": 0,
+                "o3_sigma": 1,
+                "first_atom_type": 9,
+                "second_atom_type": 1,
+            }
+        )
+        torch.testing.assert_close(hf_out.values, torch.zeros_like(hf_out.values))
+        torch.testing.assert_close(fh_out.values, torch.zeros_like(fh_out.values))

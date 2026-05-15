@@ -578,7 +578,7 @@ class DPA3(ModelInterface[ModelHypers]):
 
     def get_fixed_scaling_weights(
         self,
-    ) -> dict[str, Union[float, dict[int, float]]]:
+    ) -> dict[str, Union[float, dict[int, float], dict[int, dict[int, float]]]]:
         """Return per-type scaling factors extracted from a loaded model.
 
         These are passed to ``Scaler.train_model`` as ``fixed_weights``.
