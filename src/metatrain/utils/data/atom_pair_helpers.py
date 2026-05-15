@@ -117,7 +117,8 @@ def get_bidirectional_edges(tmap: TensorMap) -> TensorMap:
                 new_keys.append(key.values)
             elif key["first_atom_type"] > key["second_atom_type"]:
                 raise ValueError(
-                    "Expected the input TensorMap to only contain one direction of the edges."
+                    "Expected the input TensorMap to only contain "
+                    "one direction of the edges."
                 )
 
         # Get the reverse connections (i -> j becomes j -> i, and the supercell
@@ -205,13 +206,14 @@ def get_bidirectional_edges_transform(
         extra: dict[str, TensorMap],
     ) -> tuple[list[System], dict[str, TensorMap], dict[str, TensorMap]]:
         """
-        Transform function that gets the bidirectional edges from the
-        single direction ones.
+        Transform function that gets the bidirectional edges from the single direction
+        ones.
 
         :param systems: List of systems.
         :param targets: Dictionary containing the targets corresponding to the systems.
         :param extra: Dictionary containing any extra data.
-        :return: The systems, targets and extra data with bidirectional data for the edges.
+        :return: The systems, targets and extra data with bidirectional data for the
+            edges.
         """
         for name, tensor in targets.items():
             if (

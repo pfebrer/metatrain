@@ -4,6 +4,7 @@ metatomic. The class ``CompositionModel`` wraps this to be compatible with
 metatrain-style objects.
 """
 
+import itertools
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -13,7 +14,9 @@ from metatensor.torch import Labels, LabelsEntry, TensorBlock, TensorMap
 from metatomic.torch import ModelOutput, System
 
 
-FixedCompositionWeights = dict[str, float | dict[int, float]]
+FixedCompositionWeights = dict[
+    str, float | dict[int, float] | dict[int, dict[int, float]]
+]
 
 
 class BaseCompositionModel(torch.nn.Module):
@@ -76,6 +79,7 @@ class BaseCompositionModel(torch.nn.Module):
     weights: Dict[str, TensorMap]
     sample_kinds: Dict[str, str]
     type_to_index: torch.Tensor
+    type_pair_to_index: torch.Tensor
     XTX: Dict[str, TensorMap]
     XTY: Dict[str, TensorMap]
 
@@ -100,6 +104,16 @@ class BaseCompositionModel(torch.nn.Module):
         for i, atomic_type in enumerate(self.atomic_types):
             self.type_to_index[atomic_type] = i
 
+        n_types = len(self.atomic_types)
+        max_type = int(self.atomic_types.max().item())
+        _type_pair_to_index = torch.full(
+            (max_type + 1, max_type + 1), -1, dtype=torch.long
+        )
+        for i, at_i in enumerate(self.atomic_types.tolist()):
+            for j, at_j in enumerate(self.atomic_types.tolist()):
+                _type_pair_to_index[at_i, at_j] = i * n_types + j
+        self.register_buffer("type_pair_to_index", _type_pair_to_index)
+
         # Add targets based on provided layouts
         for target_name, layout in layouts.items():
             self.add_output(target_name, layout)
@@ -117,9 +131,14 @@ class BaseCompositionModel(torch.nn.Module):
         self.target_names.append(target_name)
         valid_sample_names = [
             ["system"],
+            ["system", "atom"],
             [
                 "system",
-                "atom",
+                "first_atom",
+                "second_atom",
+                "cell_shift_a",
+                "cell_shift_b",
+                "cell_shift_c",
             ],
         ]
 
@@ -128,6 +147,9 @@ class BaseCompositionModel(torch.nn.Module):
 
         elif layout.sample_names == valid_sample_names[1]:
             self.sample_kinds[target_name] = "per_atom"
+
+        elif layout.sample_names == valid_sample_names[2]:
+            self.sample_kinds[target_name] = "per_atom_pair"
 
         else:
             raise ValueError(
@@ -150,8 +172,15 @@ class BaseCompositionModel(torch.nn.Module):
 
         # Initialize TensorMaps for XTX and XTY for this target.
         #
+        # For per_structure / per_atom targets:
         #  - XTX is a square matrix of shape (n_atomic_types, n_atomic_types)
         #  - XTY is a matrix of shape (n_atomic_types, n_components, n_properties)
+        #
+        # For per_atom_pair targets (mirroring the per-atom and atom-pair Scaler
+        # designs), all blocks share the same n_type_pairs sample labels where
+        # n_type_pairs = n_atomic_types²:
+        #  - XTX is a diagonal matrix of shape (n_type_pairs, n_type_pairs)
+        #  - XTY is a matrix of shape (n_type_pairs, n_components, n_properties)
         #
         # Both are initialized with zeros, and accumulated during fitting by iterating
         # over batches in the passed dataloader.
@@ -161,58 +190,125 @@ class BaseCompositionModel(torch.nn.Module):
         #
         # Then a linear system is solved for each target to obtain the composition
         # weights, which are stored in the `weights` attribute.
-        self.XTX[target_name] = TensorMap(
-            layout.keys,
-            blocks=[
-                TensorBlock(
-                    values=torch.zeros(
-                        len(self.atomic_types),
-                        len(self.atomic_types),
-                        dtype=torch.float64,
-                    ),
-                    samples=Labels(["center_type"], self.atomic_types.reshape(-1, 1)),
-                    components=[],
-                    properties=Labels(
-                        ["center_type"], self.atomic_types.reshape(-1, 1)
-                    ),
-                )
-                for _ in layout
-            ],
-        )
-        self.XTY[target_name] = TensorMap(
-            layout.keys,
-            blocks=[
-                TensorBlock(
-                    values=torch.zeros(
-                        len(self.atomic_types),
-                        *[len(c) for c in block.components],
-                        len(block.properties),
-                        dtype=torch.float64,
-                    ),
-                    samples=Labels(["center_type"], self.atomic_types.reshape(-1, 1)),
-                    components=block.components,
-                    properties=block.properties,
-                )
-                for block in layout
-            ],
-        )
-        self.weights[target_name] = TensorMap(
-            layout.keys,
-            blocks=[
-                TensorBlock(
-                    values=torch.zeros(
-                        len(self.atomic_types),
-                        *[len(c) for c in block.components],
-                        len(block.properties),
-                        dtype=torch.float64,
-                    ),
-                    samples=Labels(["center_type"], self.atomic_types.reshape(-1, 1)),
-                    components=block.components,
-                    properties=block.properties,
-                )
-                for block in layout
-            ],
-        )
+        if self.sample_kinds[target_name] == "per_atom_pair":
+            # All blocks share the same n_types² sample labels, one row per
+            # (first_atom_type, second_atom_type) pair.  This mirrors the
+            # per-atom design (center_type labels shared across all blocks) and
+            # the atom-pair Scaler design.
+            n_types = len(self.atomic_types)
+            n_type_pairs = n_types * n_types
+            pair_values = torch.tensor(
+                list(itertools.product(self.atomic_types.tolist(), repeat=2)),
+                dtype=torch.int32,
+            ).reshape(n_type_pairs, 2)
+            pair_samples = Labels(["first_atom_type", "second_atom_type"], pair_values)
+            self.XTX[target_name] = TensorMap(
+                layout.keys,
+                blocks=[
+                    TensorBlock(
+                        values=torch.zeros(
+                            n_type_pairs, n_type_pairs, dtype=torch.float64
+                        ),
+                        samples=pair_samples,
+                        components=[],
+                        properties=pair_samples,
+                    )
+                    for _ in layout
+                ],
+            )
+            self.XTY[target_name] = TensorMap(
+                layout.keys,
+                blocks=[
+                    TensorBlock(
+                        values=torch.zeros(
+                            n_type_pairs,
+                            *[len(c) for c in block.components],
+                            len(block.properties),
+                            dtype=torch.float64,
+                        ),
+                        samples=pair_samples,
+                        components=block.components,
+                        properties=block.properties,
+                    )
+                    for block in layout
+                ],
+            )
+            self.weights[target_name] = TensorMap(
+                layout.keys,
+                blocks=[
+                    TensorBlock(
+                        values=torch.zeros(
+                            n_type_pairs,
+                            *[len(c) for c in block.components],
+                            len(block.properties),
+                            dtype=torch.float64,
+                        ),
+                        samples=pair_samples,
+                        components=block.components,
+                        properties=block.properties,
+                    )
+                    for block in layout
+                ],
+            )
+        else:
+            self.XTX[target_name] = TensorMap(
+                layout.keys,
+                blocks=[
+                    TensorBlock(
+                        values=torch.zeros(
+                            len(self.atomic_types),
+                            len(self.atomic_types),
+                            dtype=torch.float64,
+                        ),
+                        samples=Labels(
+                            ["center_type"], self.atomic_types.reshape(-1, 1)
+                        ),
+                        components=[],
+                        properties=Labels(
+                            ["center_type"], self.atomic_types.reshape(-1, 1)
+                        ),
+                    )
+                    for _ in layout
+                ],
+            )
+            self.XTY[target_name] = TensorMap(
+                layout.keys,
+                blocks=[
+                    TensorBlock(
+                        values=torch.zeros(
+                            len(self.atomic_types),
+                            *[len(c) for c in block.components],
+                            len(block.properties),
+                            dtype=torch.float64,
+                        ),
+                        samples=Labels(
+                            ["center_type"], self.atomic_types.reshape(-1, 1)
+                        ),
+                        components=block.components,
+                        properties=block.properties,
+                    )
+                    for block in layout
+                ],
+            )
+            self.weights[target_name] = TensorMap(
+                layout.keys,
+                blocks=[
+                    TensorBlock(
+                        values=torch.zeros(
+                            len(self.atomic_types),
+                            *[len(c) for c in block.components],
+                            len(block.properties),
+                            dtype=torch.float64,
+                        ),
+                        samples=Labels(
+                            ["center_type"], self.atomic_types.reshape(-1, 1)
+                        ),
+                        components=block.components,
+                        properties=block.properties,
+                    )
+                    for block in layout
+                ],
+            )
 
     def accumulate(
         self,
@@ -250,6 +346,8 @@ class BaseCompositionModel(torch.nn.Module):
                 X = self._compute_X_per_structure(systems)
             elif sample_kind == "per_atom":
                 X = self._compute_X_per_atom(systems, self.atomic_types)
+            elif sample_kind == "per_atom_pair":
+                continue  # X not needed; accumulated directly from block values
             else:
                 raise ValueError(
                     f"unknown sample kind: {sample_kind} for target {target_name}"
@@ -273,6 +371,67 @@ class BaseCompositionModel(torch.nn.Module):
         for target_name, target in targets.items():
             for key, block in target.items():
                 if not _include_key(key):
+                    continue
+
+                # Per-atom-pair: accumulate using the type-pair flat index.
+                # XTX is diagonal (n_type_pairs × n_type_pairs); XTY has
+                # n_type_pairs rows.  Each edge contributes to the row indexed
+                # by its (first_atom_type, second_atom_type) flat index.
+                if self.sample_kinds[target_name] == "per_atom_pair":
+                    Y = block.values
+                    if "o3_lambda_1" in key.names:
+                        # Rank-2: fit only the invariant (trace) contribution.
+                        traces = torch.diagonal(Y, dim1=1, dim2=2).mean(dim=-1)
+                        Id = torch.eye(Y.shape[1], dtype=dtype, device=device)
+                        Y = torch.einsum("sp,ij->sijp", traces, Id)
+
+                    if "first_atom_type" in key.names:
+                        # Atomic-basis block: all edges share the type pair
+                        # encoded in the key.
+                        flat_idx = int(
+                            self.type_pair_to_index[
+                                int(key["first_atom_type"]),
+                                int(key["second_atom_type"]),
+                            ].item()
+                        )
+                        n_edges = Y.shape[0]
+                        self.XTX[target_name][key].values[flat_idx, flat_idx] += n_edges
+                        self.XTY[target_name][key].values[flat_idx] += Y.sum(dim=0)
+                    else:
+                        # General block: resolve the pair type per edge from
+                        # the (system, first_atom, second_atom) sample columns.
+                        system_col = block.samples.column("system").long().cpu()
+                        first_col = block.samples.column("first_atom").long().cpu()
+                        second_col = block.samples.column("second_atom").long().cpu()
+                        all_types_cpu = torch.cat([s.types.cpu() for s in systems])
+                        system_lengths_cpu = torch.tensor(
+                            [len(s.types) for s in systems], dtype=torch.long
+                        )
+                        offsets_cpu = torch.zeros(len(systems), dtype=torch.long)
+                        if len(systems) > 1:
+                            offsets_cpu[1:] = torch.cumsum(
+                                system_lengths_cpu[:-1], dim=0
+                            )
+                        first_types = all_types_cpu[
+                            offsets_cpu[system_col] + first_col
+                        ].to(device)
+                        second_types = all_types_cpu[
+                            offsets_cpu[system_col] + second_col
+                        ].to(device)
+                        pair_indices = self.type_pair_to_index[
+                            first_types, second_types
+                        ]
+                        n_type_pairs = len(self.atomic_types) ** 2
+                        counts = torch.bincount(
+                            pair_indices, minlength=n_type_pairs
+                        ).to(dtype=torch.float64, device=device)
+                        self.XTX[target_name][key].values[:] += torch.diag(counts)
+                        idx = pair_indices.reshape(
+                            -1, *[1] * len(Y.shape[1:])
+                        ).expand_as(Y)
+                        self.XTY[target_name][key].values.scatter_add_(
+                            dim=0, index=idx, src=Y
+                        )
                     continue
 
                 # Get X and XTX for this block.
@@ -312,13 +471,17 @@ class BaseCompositionModel(torch.nn.Module):
     def _sanitize_fixed_weights(
         self,
         fixed_weights: Optional[FixedCompositionWeights],
-    ) -> dict[str, dict[int, float]]:
+    ) -> dict[str, dict[int, float] | dict[tuple[int, int], float]]:
         """Sanitizes the input fixed composition weights to ensure that all targets
-        contain a dict of atomic types to weights.
+        contain a dict of atomic types (or type-pairs) to weights.
 
-        This function converts something like `{"energy": 1.0}` to
-        `{"energy": {1: 1.0, 6: 1.0, 7: 1.0, 8: 1.0}}` if the atomic types are
-        `[1, 6, 7, 8]`.
+        For per-atom targets, this converts ``{"energy": 1.0}`` to
+        ``{"energy": {1: 1.0, 6: 1.0, 7: 1.0, 8: 1.0}}`` if the atomic types are
+        ``[1, 6, 7, 8]``.
+
+        For per-atom-pair targets, a float shorthand expands to a dict keyed by
+        ``(Z1, Z2)`` tuples covering all pairs, and a nested ``{Z1: {Z2: weight}}``
+        dict is flattened to the same tuple-keyed form.
 
         :param fixed_weights: The raw fixed weights provided by the user.
         :return: The sanitized fixed weights.
@@ -328,7 +491,9 @@ class BaseCompositionModel(torch.nn.Module):
 
         atomic_types = self.atomic_types.tolist()
 
-        sanitized_fixed_weights = {}
+        sanitized_fixed_weights: dict[
+            str, dict[int, float] | dict[tuple[int, int], float]
+        ] = {}
         for target_name, weights in fixed_weights.items():
             if target_name not in self.target_names:
                 logging.warning(
@@ -337,20 +502,55 @@ class BaseCompositionModel(torch.nn.Module):
                 )
                 continue
 
-            if isinstance(weights, float):
-                # A float is provided for this target, which means that the same
-                # weight should be used for all atomic types.
-                weights = {
-                    int(atomic_type): float(weights) for atomic_type in atomic_types
-                }
-            elif missing_types := set(atomic_types) - set(weights):
-                # The user provided a dict, check that all atomic types are present.
-                raise ValueError(
-                    f"Fixed weights for target '{target_name}' are missing "
-                    f"the following atomic types: {missing_types}"
-                )
-
-            sanitized_fixed_weights[target_name] = weights
+            if self.sample_kinds[target_name] == "per_atom_pair":
+                all_pairs = list(itertools.product(atomic_types, repeat=2))
+                if isinstance(weights, float):
+                    # Same weight for every (Z1, Z2) pair.
+                    sanitized_fixed_weights[target_name] = {
+                        (at_i, at_j): float(weights) for at_i, at_j in all_pairs
+                    }
+                elif isinstance(weights, dict):
+                    # Nested {Z1: {Z2: weight}} form from YAML.
+                    flat: dict[tuple[int, int], float] = {}
+                    for at_i, inner in weights.items():
+                        if not isinstance(inner, dict):
+                            raise ValueError(
+                                f"Fixed weights for per-atom-pair target "
+                                f"'{target_name}' must be a float or a nested dict "
+                                f"{{Z1: {{Z2: weight}}}}, got a flat dict instead."
+                            )
+                        for at_j, w in inner.items():
+                            flat[(int(at_i), int(at_j))] = float(w)
+                    missing_pairs = set(all_pairs) - set(flat.keys())
+                    if missing_pairs:
+                        raise ValueError(
+                            f"Fixed weights for per-atom-pair target '{target_name}' "
+                            f"are missing the following type pairs: {missing_pairs}"
+                        )
+                    sanitized_fixed_weights[target_name] = flat
+                else:
+                    raise ValueError(
+                        f"Fixed weights for per-atom-pair target '{target_name}' "
+                        f"must be a float or a nested dict {{Z1: {{Z2: weight}}}}."
+                    )
+            else:
+                if isinstance(weights, float):
+                    # A float is provided for this target, which means that the same
+                    # weight should be used for all atomic types.
+                    sanitized_fixed_weights[target_name] = {
+                        int(atomic_type): float(weights) for atomic_type in atomic_types
+                    }
+                elif missing_types := set(atomic_types) - set(weights):
+                    # The user provided a dict, check that all atomic types are present.
+                    raise ValueError(
+                        f"Fixed weights for target '{target_name}' are missing "
+                        f"the following atomic types: {missing_types}"
+                    )
+                else:
+                    sanitized_fixed_weights[target_name] = {
+                        int(k): float(v)  # type: ignore[arg-type]
+                        for k, v in weights.items()
+                    }
 
         return sanitized_fixed_weights
 
@@ -387,21 +587,40 @@ class BaseCompositionModel(torch.nn.Module):
                 XTY_values = XTY_block.values
 
                 if target_name in sanitized_fixed_weights:
-                    weight_vals = torch.vstack(
-                        [
-                            torch.full(
-                                (
-                                    1,
-                                    *[len(c) for c in XTY_block.components],
-                                    len(XTY_block.properties),
-                                ),
-                                sanitized_fixed_weights[target_name][int(atomic_type)],
-                                dtype=XTY_values.dtype,
-                                device=XTY_values.device,
-                            )
-                            for atomic_type in self.atomic_types
-                        ]
+                    fw = sanitized_fixed_weights[target_name]
+                    block_shape = (
+                        1,
+                        *[len(c) for c in XTY_block.components],
+                        len(XTY_block.properties),
                     )
+                    if self.sample_kinds[target_name] == "per_atom_pair":
+                        # fw is keyed by (Z1, Z2) tuples; rows follow the order
+                        # of itertools.product(atomic_types, repeat=2).
+                        weight_vals = torch.vstack(
+                            [
+                                torch.full(
+                                    block_shape,
+                                    fw[(at_i, at_j)],  # type: ignore[index]
+                                    dtype=XTY_values.dtype,
+                                    device=XTY_values.device,
+                                )
+                                for at_i, at_j in itertools.product(
+                                    self.atomic_types.tolist(), repeat=2
+                                )
+                            ]
+                        )
+                    else:
+                        weight_vals = torch.vstack(
+                            [
+                                torch.full(
+                                    block_shape,
+                                    fw[int(atomic_type)],  # type: ignore[index]
+                                    dtype=XTY_values.dtype,
+                                    device=XTY_values.device,
+                                )
+                                for atomic_type in self.atomic_types
+                            ]
+                        )
                 else:
                     XTY_shape = XTY_values.shape
                     if len(XTY_values.shape) != 2:
@@ -423,13 +642,14 @@ class BaseCompositionModel(torch.nn.Module):
                         )
 
                     else:
-                        if self.sample_kinds[target_name] != "per_atom":
+                        if self.sample_kinds[target_name] == "per_structure":
                             # Solve linear system explicitly.
                             weight_vals = _solve_linear_system(XTX_values, XTY_values)
                         else:
-                            # XTX in this case is a diagonal matrix (the counts of atoms
-                            # of each type), so we can solve it faster. This also avoids
-                            # NaNs getting leaked from one atom type to another.
+                            # per_atom and per_atom_pair: XTX is diagonal
+                            # (counts of atoms/pairs per type/type-pair), so we
+                            # solve faster by dividing XTY by the diagonal.
+                            # This also avoids NaN cross-leakage between rows.
                             weight_vals = XTY_values / torch.diag(XTX_values).unsqueeze(
                                 1
                             )
@@ -489,54 +709,199 @@ class BaseCompositionModel(torch.nn.Module):
                 )
             weights = self.weights[output_name]
 
-            prediction_key_vals = []
+            prediction_key_vals: List[torch.Tensor] = []
             prediction_blocks: List[TensorBlock] = []
-            for key, weight_block in weights.items():
-                sample_labels_block = sample_labels
 
-                # If selected_atoms is provided, slice the samples labels and the X
-                # tensor
-                if selected_atoms is None:
-                    X_block = X
-                else:
-                    sample_indices = sample_labels_block.select(selected_atoms)
-                    sample_labels_block = Labels(
-                        sample_labels_block.names,
-                        sample_labels_block.values[sample_indices],
-                    ).to(device=device)
-                    X_block = X[sample_indices]
-
-                # Handle the case of atomic basis targets where there is a subset of
-                # atoms in the samples of each block
-                if "atom_type" in key.names:
-                    type_index = self.type_to_index[int(key["atom_type"])]
-                    atom_type_mask = X_block[:, type_index].to(dtype=torch.bool)
-                    sample_labels_block = Labels(
-                        sample_labels_block.names,
-                        sample_labels_block.values[atom_type_mask],
-                    ).to(device=device)
-                    X_block = X_block[atom_type_mask]
-
-                # Compute X.T @ W
-                if self.sample_kinds[output_name] != "per_atom":
-                    out_vals = torch.tensordot(
-                        X_block, weight_block.values, dims=([1], [0])
+            if self.sample_kinds[output_name] == "per_atom_pair":
+                # Produce per-edge predictions by looking up the fitted weight
+                # for each edge's (first_atom_type, second_atom_type) pair.
+                all_nl_options = systems[0].known_neighbor_lists()
+                if len(all_nl_options) == 0:
+                    raise ValueError(
+                        f"No neighbor list found in systems. The composition model "
+                        f"requires a neighbor list to predict atom-pair target "
+                        f"'{output_name}'."
                     )
-                else:
-                    # No multiplication is needed for per-atom targets, we just need to
-                    # broadcast the weights according to the atom types in the samples.
-                    # This also avoids NaN getting leaked from one atom type to another.
-                    out_vals = weight_block.values[X_block.argmax(dim=1)]
+                nl_options = all_nl_options[0]
 
-                prediction_blocks.append(
-                    TensorBlock(
-                        values=out_vals,
-                        samples=sample_labels_block,
-                        components=weight_block.components,
-                        properties=weight_block.properties,
-                    )
+                # Build a concatenated types tensor and per-system offsets so we
+                # can resolve (system_idx, atom_idx) → atom_type in O(1).
+                all_types = torch.cat([s.types for s in systems]).to(device)
+                system_lengths = torch.tensor(
+                    [len(s.types) for s in systems],
+                    dtype=torch.long,
+                    device=device,
                 )
-                prediction_key_vals.append(key.values)
+                system_offsets = torch.zeros(
+                    len(systems), dtype=torch.long, device=device
+                )
+                if len(systems) > 1:
+                    system_offsets[1:] = torch.cumsum(system_lengths[:-1], dim=0)
+
+                for key, weight_block in weights.items():
+                    has_pair_key = "first_atom_type" in key.names
+                    fa_type = int(key["first_atom_type"]) if has_pair_key else -1
+                    sa_type = int(key["second_atom_type"]) if has_pair_key else -1
+
+                    all_sys_idx: List[torch.Tensor] = []
+                    all_fa_idx: List[torch.Tensor] = []
+                    all_sa_idx: List[torch.Tensor] = []
+                    all_shift_a: List[torch.Tensor] = []
+                    all_shift_b: List[torch.Tensor] = []
+                    all_shift_c: List[torch.Tensor] = []
+
+                    for i_sys, system in enumerate(systems):
+                        nl = system.get_neighbor_list(nl_options)
+                        fa_col = nl.samples.column("first_atom")
+                        sa_col = nl.samples.column("second_atom")
+
+                        if has_pair_key:
+                            fa_types_nl = system.types[fa_col]
+                            sa_types_nl = system.types[sa_col]
+                            mask = (fa_types_nl == fa_type) & (sa_types_nl == sa_type)
+                            fa_sel = fa_col[mask]
+                            sa_sel = sa_col[mask]
+                            ca_sel = nl.samples.column("cell_shift_a")[mask]
+                            cb_sel = nl.samples.column("cell_shift_b")[mask]
+                            cc_sel = nl.samples.column("cell_shift_c")[mask]
+                        else:
+                            # Non-atomic-basis: use all edges.
+                            fa_sel = fa_col
+                            sa_sel = sa_col
+                            ca_sel = nl.samples.column("cell_shift_a")
+                            cb_sel = nl.samples.column("cell_shift_b")
+                            cc_sel = nl.samples.column("cell_shift_c")
+
+                        n = fa_sel.shape[0]
+                        if n > 0:
+                            all_sys_idx.append(
+                                torch.full(
+                                    (n,), i_sys, dtype=torch.int32, device=device
+                                )
+                            )
+                            all_fa_idx.append(fa_sel.to(dtype=torch.int32))
+                            all_sa_idx.append(sa_sel.to(dtype=torch.int32))
+                            all_shift_a.append(ca_sel.to(dtype=torch.int32))
+                            all_shift_b.append(cb_sel.to(dtype=torch.int32))
+                            all_shift_c.append(cc_sel.to(dtype=torch.int32))
+
+                    if all_sys_idx:
+                        sample_vals = torch.stack(
+                            [
+                                torch.cat(all_sys_idx),
+                                torch.cat(all_fa_idx),
+                                torch.cat(all_sa_idx),
+                                torch.cat(all_shift_a),
+                                torch.cat(all_shift_b),
+                                torch.cat(all_shift_c),
+                            ],
+                            dim=1,
+                        )
+                    else:
+                        sample_vals = torch.empty(
+                            0, 6, dtype=torch.int32, device=device
+                        )
+
+                    n_edges = sample_vals.shape[0]
+                    if has_pair_key:
+                        # All edges already filtered to this type pair.  Fill
+                        # an index tensor with the single flat index so we can
+                        # use the same fancy-indexing path as the general case
+                        # (avoids TorchScript-incompatible *shape unpacking).
+                        flat_idx = self.type_pair_to_index[fa_type, sa_type].item()
+                        pair_flat_indices = torch.full(
+                            (n_edges,),
+                            flat_idx,
+                            dtype=torch.long,
+                            device=device,
+                        )
+                    else:
+                        # Non-atomic-basis: look up the pair type per edge and
+                        # index directly into the weight rows.
+                        sys_idx_long = sample_vals[:, 0].long()
+                        fa_idx_long = sample_vals[:, 1].long()
+                        sa_idx_long = sample_vals[:, 2].long()
+                        first_types_nl = all_types[
+                            system_offsets[sys_idx_long] + fa_idx_long
+                        ]
+                        second_types_nl = all_types[
+                            system_offsets[sys_idx_long] + sa_idx_long
+                        ]
+                        pair_flat_indices = self.type_pair_to_index[
+                            first_types_nl, second_types_nl
+                        ]
+                    # n_edges == 0 is handled naturally: empty index tensor
+                    # produces an empty output tensor with the correct shape.
+                    out_vals = weight_block.values[pair_flat_indices]
+
+                    prediction_blocks.append(
+                        TensorBlock(
+                            values=out_vals,
+                            samples=Labels(
+                                [
+                                    "system",
+                                    "first_atom",
+                                    "second_atom",
+                                    "cell_shift_a",
+                                    "cell_shift_b",
+                                    "cell_shift_c",
+                                ],
+                                sample_vals,
+                            ),
+                            components=weight_block.components,
+                            properties=weight_block.properties,
+                        )
+                    )
+                    prediction_key_vals.append(key.values)
+
+            else:
+                for key, weight_block in weights.items():
+                    sample_labels_block = sample_labels
+
+                    # If selected_atoms is provided, slice the samples labels and the X
+                    # tensor
+                    if selected_atoms is None:
+                        X_block = X
+                    else:
+                        sample_indices = sample_labels_block.select(selected_atoms)
+                        sample_labels_block = Labels(
+                            sample_labels_block.names,
+                            sample_labels_block.values[sample_indices],
+                        ).to(device=device)
+                        X_block = X[sample_indices]
+
+                    # Handle the case of atomic basis targets where there is a subset of
+                    # atoms in the samples of each block
+                    if "atom_type" in key.names:
+                        type_index = self.type_to_index[int(key["atom_type"])]
+                        atom_type_mask = X_block[:, type_index].to(dtype=torch.bool)
+                        sample_labels_block = Labels(
+                            sample_labels_block.names,
+                            sample_labels_block.values[atom_type_mask],
+                        ).to(device=device)
+                        X_block = X_block[atom_type_mask]
+
+                    # Compute X.T @ W
+                    if self.sample_kinds[output_name] != "per_atom":
+                        out_vals = torch.tensordot(
+                            X_block, weight_block.values, dims=([1], [0])
+                        )
+                    else:
+                        # No multiplication is needed for per-atom targets, we just need
+                        # to broadcast the weights according to the atom types in the
+                        # samples. This also avoids NaN getting leaked from one atom
+                        # type to another.
+                        out_vals = weight_block.values[X_block.argmax(dim=1)]
+
+                    prediction_blocks.append(
+                        TensorBlock(
+                            values=out_vals,
+                            samples=sample_labels_block,
+                            components=weight_block.components,
+                            properties=weight_block.properties,
+                        )
+                    )
+                    prediction_key_vals.append(key.values)
 
             prediction = TensorMap(
                 Labels(
@@ -604,6 +969,7 @@ class BaseCompositionModel(torch.nn.Module):
 
         self.atomic_types = self.atomic_types.to(device=device)
         self.type_to_index = self.type_to_index.to(device=device)
+        self.type_pair_to_index = self.type_pair_to_index.to(device=device)
         self.XTX = {
             target_name: tm.to(device=device, dtype=dtype)
             for target_name, tm in self.XTX.items()
@@ -639,6 +1005,13 @@ def _include_key(key: LabelsEntry) -> bool:
           "o3_sigma_2", "atom_type"] it is included if values are equal for the two
           lambda, and the sigma values are 1 (these are rank 2 tensors where the
           trace is invariant, and these tensors belong to an atomic basis target).
+        - If the key has names ["o3_lambda", "o3_sigma", "first_atom_type",
+          "second_atom_type"] it is included if values are 0 and 1 respectively
+          (indicating an invariant block of an atom-pair atomic-basis spherical target).
+        - If the key has names ["o3_lambda_1", "o3_lambda_2", "o3_sigma_1",
+          "o3_sigma_2", "first_atom_type", "second_atom_type"] it is included if
+          values are equal for the two lambda and the sigma values are equal (rank 2
+          atom-pair atomic-basis tensors where the trace is invariant).
 
     :param key: The key to check.
 
@@ -647,7 +1020,7 @@ def _include_key(key: LabelsEntry) -> bool:
     valid_key_names = [
         ["_"],  # scalar
         ["o3_lambda", "o3_sigma"],  # spherical rank 1
-        ["o3_lambda", "o3_sigma", "atom_type"],  # atomic basis rank 1
+        ["o3_lambda", "o3_sigma", "atom_type"],  # atomic basis rank 1 (per-atom)
         ["o3_lambda_1", "o3_lambda_2", "o3_sigma_1", "o3_sigma_2"],  # spherical rank 2
         [
             "o3_lambda_1",
@@ -655,7 +1028,21 @@ def _include_key(key: LabelsEntry) -> bool:
             "o3_sigma_1",
             "o3_sigma_2",
             "atom_type",
-        ],  # atomic basis rank 2
+        ],  # atomic basis rank 2 (per-atom)
+        [
+            "o3_lambda",
+            "o3_sigma",
+            "first_atom_type",
+            "second_atom_type",
+        ],  # atomic basis rank 1 (per-atom-pair)
+        [
+            "o3_lambda_1",
+            "o3_lambda_2",
+            "o3_sigma_1",
+            "o3_sigma_2",
+            "first_atom_type",
+            "second_atom_type",
+        ],  # atomic basis rank 2 (per-atom-pair)
     ]
     include_key = False
 
@@ -671,6 +1058,19 @@ def _include_key(key: LabelsEntry) -> bool:
             include_key = True
 
     elif key.names == valid_key_names[3] or key.names == valid_key_names[4]:
+        if (
+            key["o3_lambda_1"] == key["o3_lambda_2"]
+            and key["o3_sigma_1"] == key["o3_sigma_2"]
+        ):
+            include_key = True
+
+    elif key.names == valid_key_names[5]:
+        # Atom-pair atomic basis rank 1: include the invariant block.
+        if key["o3_lambda"] == 0 and key["o3_sigma"] == 1:
+            include_key = True
+
+    elif key.names == valid_key_names[6]:
+        # Atom-pair atomic basis rank 2: include blocks where trace is invariant.
         if (
             key["o3_lambda_1"] == key["o3_lambda_2"]
             and key["o3_sigma_1"] == key["o3_sigma_2"]

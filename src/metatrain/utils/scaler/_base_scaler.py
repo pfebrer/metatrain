@@ -3,6 +3,7 @@ Contains the ``BaseScaler`` class. This is intended for eventual porting to meta
 The class ``Scaler`` wraps this to be compatible with metatrain-style objects.
 """
 
+import itertools
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -11,7 +12,9 @@ from metatensor.torch import Labels, TensorBlock, TensorMap
 from metatomic.torch import System
 
 
-FixedScalerWeights = dict[str, Union[float, dict[int, float]]]
+FixedScalerWeights = dict[
+    str, Union[float, dict[int, float], dict[int, dict[int, float]]]
+]
 
 
 class BaseScaler(torch.nn.Module):
@@ -37,6 +40,7 @@ class BaseScaler(torch.nn.Module):
     scales: Dict[str, TensorMap]
     sample_kinds: Dict[str, str]
     type_to_index: torch.Tensor
+    type_pair_to_index: torch.Tensor
     N: Dict[str, TensorMap]
     Y2: Dict[str, TensorMap]
     per_property_N: Dict[str, TensorMap]
@@ -67,6 +71,21 @@ class BaseScaler(torch.nn.Module):
         for i, atomic_type in enumerate(self.atomic_types):
             self.type_to_index[atomic_type] = i
 
+        # go from an (first_atom_type, second_atom_type) pair to a flat index
+        # in [0, n_types^2), where the flat index is i * n_types + j with
+        # i = type_to_index[first_atom_type], j = type_to_index[second_atom_type].
+        # This 2D buffer avoids recomputing the flat index via type_to_index lookups
+        # and two arithmetic operations every time we need it.
+        n_types = len(self.atomic_types)
+        max_type = int(self.atomic_types.max().item())
+        type_pair_to_index = torch.full(
+            (max_type + 1, max_type + 1), -1, dtype=torch.long
+        )
+        for i, at_i in enumerate(self.atomic_types.tolist()):
+            for j, at_j in enumerate(self.atomic_types.tolist()):
+                type_pair_to_index[at_i, at_j] = i * n_types + j
+        self.register_buffer("type_pair_to_index", type_pair_to_index)
+
         # Add targets based on provided layouts
         for target_name, layout in layouts.items():
             self.add_output(target_name, layout)
@@ -88,6 +107,14 @@ class BaseScaler(torch.nn.Module):
                 "system",
                 "atom",
             ],
+            [
+                "system",
+                "first_atom",
+                "second_atom",
+                "cell_shift_a",
+                "cell_shift_b",
+                "cell_shift_c",
+            ],
         ]
 
         if layout.sample_names == valid_sample_names[0]:
@@ -99,6 +126,15 @@ class BaseScaler(torch.nn.Module):
             samples = Labels(
                 ["atomic_type"], torch.arange(len(self.atomic_types)).reshape(-1, 1)
             )
+
+        elif layout.sample_names == valid_sample_names[2]:
+            self.sample_kinds[target_name] = "per_atom_pair"
+            n_types = len(self.atomic_types)
+            pair_values = torch.tensor(
+                list(itertools.product(self.atomic_types.tolist(), repeat=2)),
+                dtype=torch.int32,
+            ).reshape(n_types * n_types, 2)
+            samples = Labels(["first_atomic_type", "second_atomic_type"], pair_values)
 
         else:
             raise ValueError(
@@ -276,9 +312,7 @@ class BaseScaler(torch.nn.Module):
                 N = mask_vals.sum(dim=dim)
                 Y2 = torch.sum((Y * mask_vals) ** 2, dim=dim)
 
-            else:
-                assert self.sample_kinds[target_name] == "per_atom"
-
+            elif self.sample_kinds[target_name] == "per_atom":
                 block_types = torch.cat([system.types for system in systems])
 
                 # Initialize N and Y2 tensors for this block, which will store the
@@ -318,6 +352,80 @@ class BaseScaler(torch.nn.Module):
                             (Y[type_mask] * mask_vals[type_mask]) ** 2,
                             dim=dim,
                         )
+
+            else:
+                assert self.sample_kinds[target_name] == "per_atom_pair"
+
+                n_types = len(self.atomic_types)
+                n_pairs = n_types * n_types
+
+                if per_property:
+                    shape = [n_pairs, len(Y_block.properties)]
+                else:
+                    shape = [n_pairs]
+
+                N = torch.zeros(tuple(shape), dtype=torch.long, device=Y.device)
+                Y2 = torch.zeros(tuple(shape), dtype=Y.dtype, device=Y.device)
+
+                if "first_atom_type" in key.names and "second_atom_type" in key.names:
+                    # All samples in this block share the same type pair encoded in
+                    # the key — look up the flat index directly.
+                    first_type = key["first_atom_type"]
+                    second_type = key["second_atom_type"]
+                    flat_idx = self.type_pair_to_index[first_type, second_type].item()
+                    N[flat_idx] = mask_vals.sum(dim=dim)
+                    Y2[flat_idx] = torch.sum((Y * mask_vals) ** 2, dim=dim)
+                else:
+                    # Infer the type pair for each sample from the atom indices stored
+                    # in the block samples.
+                    first_atom_col = Y_block.samples.names.index("first_atom")
+                    second_atom_col = Y_block.samples.names.index("second_atom")
+
+                    n_samples = Y_block.samples.values.shape[0]
+                    if n_samples > 0:
+                        # Build a concatenated type array and per-system atom offsets.
+                        # All lookups are done on CPU to avoid potential device issues
+                        # with system.types, then moved to Y.device.
+                        all_types_cpu = torch.cat([s.types.cpu() for s in systems])
+                        system_lengths_cpu = torch.tensor(
+                            [len(s.types) for s in systems], dtype=torch.long
+                        )
+                        offset_cpu = torch.zeros(len(systems), dtype=torch.long)
+                        if len(systems) > 1:
+                            offset_cpu[1:] = torch.cumsum(
+                                system_lengths_cpu[:-1], dim=0
+                            )
+
+                        system_indices_cpu = Y_block.samples.values[:, 0].long().cpu()
+                        first_atom_indices_cpu = (
+                            Y_block.samples.values[:, first_atom_col].long().cpu()
+                        )
+                        second_atom_indices_cpu = (
+                            Y_block.samples.values[:, second_atom_col].long().cpu()
+                        )
+
+                        # Resolve atom indices → types, preserving original sample order
+                        block_first_types = all_types_cpu[
+                            offset_cpu[system_indices_cpu] + first_atom_indices_cpu
+                        ].to(Y.device)
+                        block_second_types = all_types_cpu[
+                            offset_cpu[system_indices_cpu] + second_atom_indices_cpu
+                        ].to(Y.device)
+
+                        # Map each sample's (first_type, second_type) → flat pair index
+                        sample_pair_indices = self.type_pair_to_index[
+                            block_first_types, block_second_types
+                        ]
+
+                        # Accumulate N and Y2 per unique type pair
+                        for flat_idx in sample_pair_indices.unique().tolist():
+                            pair_mask = sample_pair_indices == flat_idx
+                            N[flat_idx] = mask_vals[pair_mask].sum(dim=dim)
+                            Y2[flat_idx] = torch.sum(
+                                (Y[pair_mask] * mask_vals[pair_mask]) ** 2,
+                                dim=dim,
+                            )
+                    # If n_samples == 0, N and Y2 remain zero (correct).
 
             N_list.append(N)
             Y2_list.append(Y2)
@@ -700,9 +808,7 @@ class BaseScaler(torch.nn.Module):
                                 ),
                             )
 
-                else:
-                    assert self.sample_kinds[output_name] == "per_atom"
-
+                elif self.sample_kinds[output_name] == "per_atom":
                     output_block_types = torch.cat([system.types for system in systems])
                     if "atom_type" in key.names:
                         atom_type = key["atom_type"]
@@ -759,6 +865,85 @@ class BaseScaler(torch.nn.Module):
                         components=output_block.components,
                         properties=output_block.properties,
                     )
+
+                else:
+                    assert self.sample_kinds[output_name] == "per_atom_pair"
+
+                    # Build a flat pair index.
+                    n_samples = output_block.samples.values.shape[0]
+                    if (
+                        "first_atom_type" in key.names
+                        and "second_atom_type" in key.names
+                    ):
+                        fa_type = int(key["first_atom_type"])
+                        sa_type = int(key["second_atom_type"])
+                        flat_idx = int(self.type_pair_to_index[fa_type, sa_type].item())
+                        pair_flat_indices = torch.full(
+                            (n_samples,),
+                            flat_idx,
+                            dtype=torch.long,
+                            device=device,
+                        )
+                    else:
+                        system_lengths = torch.tensor(
+                            [len(s.types) for s in systems],
+                            dtype=torch.long,
+                            device=device,
+                        )
+                        offset = torch.cat(
+                            [
+                                torch.zeros(1, dtype=torch.long, device=device),
+                                torch.cumsum(system_lengths[:-1], dim=0),
+                            ]
+                        )
+                        all_types = torch.cat([s.types for s in systems]).to(device)
+
+                        system_indices = output_block.samples.values[:, 0]
+                        first_atom_col = output_block.samples.names.index("first_atom")
+                        second_atom_col = output_block.samples.names.index(
+                            "second_atom"
+                        )
+                        first_atom_indices = output_block.samples.values[
+                            :, first_atom_col
+                        ]
+                        second_atom_indices = output_block.samples.values[
+                            :, second_atom_col
+                        ]
+
+                        first_types = all_types[
+                            offset[system_indices] + first_atom_indices
+                        ]
+                        second_types = all_types[
+                            offset[system_indices] + second_atom_indices
+                        ]
+
+                        # Map each sample's (first_type, second_type) → flat pair index
+                        pair_flat_indices = self.type_pair_to_index[
+                            first_types, second_types
+                        ]
+
+                    if len(output_block.gradients_list()) > 0:
+                        raise NotImplementedError(
+                            "scaling of gradients is not implemented for atom-pair "
+                            f"target '{output_name}'"
+                        )
+
+                    if remove:  # remove the scaler
+                        scaled_vals = (
+                            scaled_vals / scales_block_values[pair_flat_indices]
+                        )
+                    else:  # apply the scaler
+                        scaled_vals = (
+                            scaled_vals * scales_block_values[pair_flat_indices]
+                        )
+
+                    prediction_block = TensorBlock(
+                        values=scaled_vals,
+                        samples=output_block.samples,
+                        components=output_block.components,
+                        properties=output_block.properties,
+                    )
+
                 prediction_blocks.append(prediction_block)
 
             predictions[output_name] = TensorMap(
@@ -769,80 +954,142 @@ class BaseScaler(torch.nn.Module):
         return predictions
 
     def _set_fixed_weights(
-        self, target_name: str, weights: Union[float, Dict[int, float]]
+        self,
+        target_name: str,
+        weights: Union[float, Dict[int, float], Dict[int, Dict[int, float]]],
     ) -> None:
         """
         Apply fixed weights to the scales of a given target.
 
         :param target_name: Name of the target to which fixed weights should be applied.
-        :param weights: Either a single float value to be applied to all atomic types,
-            or a dict mapping atomic type (int) to weight (float).
+        :param weights: Either a single float value to be applied to all rows, a dict
+            mapping atomic type (int) to weight (float) for per-atom targets, or a
+            nested dict ``{Z1: {Z2: weight}}`` for per-atom-pair targets.
         """
-        # Error out if multiple blocks or multiple properties are present. These are
-        # difficult to allow in the yaml files.
-        if len(self.scales[target_name]) > 1:
-            raise NotImplementedError(
-                "Multiple blocks are not supported for fixed weights in `Scaler` "
-                f"for target '{target_name}'"
-            )
-        if len(self.scales[target_name].block().properties) > 1:
-            raise NotImplementedError(
-                f"Multiple properties are not supported for fixed weights in `Scaler` "
-                f"for target '{target_name}'"
-            )
+        sample_kind = self.sample_kinds[target_name]
 
-        Y2_block = self.Y2[target_name].block()
-        block = TensorBlock(
-            values=torch.empty_like(Y2_block.values),  # [1, 1] or [n_types, 1]
-            samples=Y2_block.samples,
-            components=Y2_block.components,
-            properties=Y2_block.properties,
-        )
+        # Fixed weights set the per-target scale; fit_per_property() then multiplies
+        # by per-property scales to produce the full scales.  There is therefore no
+        # restriction on the number of blocks or properties: the same per-type (or
+        # per-type-pair) scalar is broadcast across all properties, and per-property
+        # variation is handled normally afterwards.
 
-        if isinstance(weights, dict):
-            for atomic_type in self.atomic_types.tolist():
-                # Error out if `weights` is a dict but the target is per-structure
-                if self.sample_kinds[target_name] == "per_structure":
+        if sample_kind == "per_atom_pair":
+            atomic_types = self.atomic_types.tolist()
+            all_pairs = list(itertools.product(atomic_types, repeat=2))
+
+            if isinstance(weights, dict):
+                # Nested {Z1: {Z2: weight}} form.
+                flat: Dict[tuple, float] = {}
+                for at_i, inner in weights.items():
+                    if not isinstance(inner, dict):
+                        raise ValueError(
+                            f"Fixed scaling weights for per-atom-pair target "
+                            f"'{target_name}' must be a float or a nested dict "
+                            f"{{Z1: {{Z2: weight}}}}, got a flat dict instead."
+                        )
+                    for at_j, w in inner.items():
+                        flat[(int(at_i), int(at_j))] = float(w)
+                missing_pairs = set(all_pairs) - set(flat.keys())
+                if missing_pairs:
                     raise ValueError(
-                        "Fixed weights as a dict are not supported for per-structure "
-                        f"target '{target_name}'"
+                        f"Fixed scaling weights for per-atom-pair target "
+                        f"'{target_name}' are missing the following type pairs: "
+                        f"{missing_pairs}"
                     )
-                # Error out if any atomic types are missing
-                if int(atomic_type) not in weights:
-                    raise ValueError(
-                        f"Atomic type {atomic_type} is missing from the fixed scaling "
-                        f"weights for target '{target_name}'"
-                    )
-                for atom_type, weight in weights.items():
-                    block.values[self.type_to_index[atom_type], 0] = weight
-        elif isinstance(weights, float):
-            if self.sample_kinds[target_name] == "per_atom":
+                pair_weights = flat
+            elif isinstance(weights, float):
                 logging.info(
-                    "Fixed weights provided as a single float for per-atom "
-                    f"target '{target_name}'. The same weight will be applied to "
-                    "all atomic types."
+                    "Fixed scaling weights provided as a single float for "
+                    f"per-atom-pair target '{target_name}'. The same weight will "
+                    "be applied to all type pairs."
                 )
-            block.values[:] = weights
-        else:
-            raise ValueError(
-                f"weights for '{target_name}' must be either a float or a dict of "
-                "int to float."
-            )
+                pair_weights = {(at_i, at_j): weights for at_i, at_j in all_pairs}
+            else:
+                raise ValueError(
+                    f"Fixed scaling weights for per-atom-pair target '{target_name}' "
+                    f"must be a float or a nested dict {{Z1: {{Z2: weight}}}}."
+                )
 
-        self.scales[target_name] = TensorMap(
-            self.Y2[target_name].keys.to(device=block.values.device),
-            [block],
-        )
-        self.per_target_scales[target_name] = TensorMap(
-            self.Y2[target_name].keys.to(device=block.values.device),
-            [block],
-        )
+            blocks = []
+            for key in self.Y2[target_name].keys:
+                Y2_block = self.Y2[target_name][key]
+                block = TensorBlock(
+                    values=torch.empty_like(Y2_block.values),
+                    samples=Y2_block.samples,
+                    components=Y2_block.components,
+                    properties=Y2_block.properties,
+                )
+                for at_i, at_j in all_pairs:
+                    idx = self.type_pair_to_index[at_i, at_j].item()
+                    # Broadcast the scalar across all properties.
+                    block.values[idx, :] = pair_weights[(at_i, at_j)]
+                blocks.append(block)
+
+            self.scales[target_name] = TensorMap(
+                self.Y2[target_name].keys.to(device=blocks[0].values.device),
+                blocks,
+            )
+            self.per_target_scales[target_name] = self.scales[target_name].copy()
+
+        else:
+            # per_structure / per_atom: validate the weight format up front, then
+            # apply the same per-type scalars to every block (broadcast across all
+            # properties so fit_per_property can multiply in per-property variation).
+            if isinstance(weights, dict):
+                if sample_kind == "per_structure":
+                    raise ValueError(
+                        "Fixed scaling weights as a dict are not supported for "
+                        f"per-structure target '{target_name}'"
+                    )
+                for atomic_type in self.atomic_types.tolist():
+                    if int(atomic_type) not in weights:
+                        raise ValueError(
+                            f"Atomic type {atomic_type} is missing from the fixed "
+                            f"scaling weights for target '{target_name}'"
+                        )
+            elif not isinstance(weights, float):
+                raise ValueError(
+                    f"Fixed scaling weights for '{target_name}' must be either a "
+                    "float or a dict of int to float."
+                )
+            else:
+                if sample_kind == "per_atom":
+                    logging.info(
+                        "Fixed scaling weights provided as a single float for "
+                        f"per-atom target '{target_name}'. The same weight will be "
+                        "applied to all atomic types."
+                    )
+
+            blocks = []
+            for key in self.Y2[target_name].keys:
+                Y2_block = self.Y2[target_name][key]
+                block = TensorBlock(
+                    values=torch.empty_like(Y2_block.values),
+                    samples=Y2_block.samples,
+                    components=Y2_block.components,
+                    properties=Y2_block.properties,
+                )
+                if isinstance(weights, dict):
+                    for atom_type, weight in weights.items():
+                        # Broadcast the scalar across all properties.
+                        block.values[self.type_to_index[atom_type], :] = weight
+                else:
+                    block.values[:] = weights
+                blocks.append(block)
+
+            self.scales[target_name] = TensorMap(
+                self.Y2[target_name].keys.to(device=blocks[0].values.device),
+                blocks,
+            )
+            self.per_target_scales[target_name] = self.scales[target_name].copy()
 
     def _sync_device_dtype(self, device: torch.device, dtype: torch.dtype) -> None:
         # manually move the TensorMap dicts:
 
         self.atomic_types = self.atomic_types.to(device=device)
         self.type_to_index = self.type_to_index.to(device=device)
+        self.type_pair_to_index = self.type_pair_to_index.to(device=device)
         self.N = {
             target_name: tm.to(device=device, dtype=dtype)
             for target_name, tm in self.N.items()

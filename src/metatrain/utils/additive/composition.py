@@ -1,3 +1,4 @@
+import itertools
 import logging
 from typing import Callable, Dict, List, Optional, Sequence, Union
 
@@ -386,7 +387,7 @@ class CompositionModel(torch.nn.Module):
         self.outputs[target_name] = ModelOutput(
             quantity=target_info.quantity,
             unit=target_info.unit,
-            sample_kind="atom",
+            sample_kind=target_info.sample_kind,
             description=target_info.description,
         )
 
@@ -403,21 +404,51 @@ class CompositionModel(torch.nn.Module):
             ),
         )
 
+        valid_sample_names = [
+            ["system"],
+            ["system", "atom"],
+            [
+                "system",
+                "first_atom",
+                "second_atom",
+                "cell_shift_a",
+                "cell_shift_b",
+                "cell_shift_c",
+            ],
+        ]
+
+        if layout.sample_names in valid_sample_names[:2]:
+            # Per-structure / per-atom: one row per atomic type, shared across blocks.
+            samples = Labels(
+                names=["center_type"],
+                values=torch.tensor(self.atomic_types, dtype=torch.int).reshape(-1, 1),
+                assume_unique=True,
+            )
+        elif layout.sample_names == valid_sample_names[2]:
+            # Per-atom-pair: all blocks share n_types² sample labels, one row
+            # per (first_atom_type, second_atom_type) pair — mirroring the
+            # per-atom design and the atom-pair Scaler.
+            n_types = len(self.atomic_types)
+            pair_values = torch.tensor(
+                list(itertools.product(self.atomic_types, repeat=2)),
+                dtype=torch.int32,
+            ).reshape(n_types * n_types, 2)
+            samples = Labels(["first_atom_type", "second_atom_type"], pair_values)
+        else:
+            raise ValueError(
+                "unknown sample kind. TensorMap has sample names"
+                f" {layout.sample_names} but expected one of "
+                f"{valid_sample_names}."
+            )
         fake_weights = TensorMap(
             keys=layout.keys,
             blocks=[
                 TensorBlock(
                     values=torch.zeros(
-                        (len(self.atomic_types),) + b.values.shape[1:],
+                        (len(samples),) + b.values.shape[1:],
                         dtype=torch.float64,
                     ),
-                    samples=Labels(
-                        names=["center_type"],
-                        values=torch.tensor(self.atomic_types, dtype=torch.int).reshape(
-                            -1, 1
-                        ),
-                        assume_unique=True,
-                    ),
+                    samples=samples,
                     components=b.components,
                     properties=b.properties,
                 )
@@ -451,12 +482,6 @@ class CompositionModel(torch.nn.Module):
         :return: ``True`` if the target is compatible with a composition model,
             ``False`` otherwise.
         """
-        if target_info.sample_kind == "atom_pair":
-            logging.debug(
-                f"Composition model does not support target {target_name} "
-                "since sample kind 'atom_pair' is not implemented yet."
-            )
-            return False
         # only scalars can have composition contributions
         if not target_info.is_scalar and not target_info.is_spherical:
             logging.debug(

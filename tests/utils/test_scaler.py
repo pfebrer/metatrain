@@ -2466,3 +2466,230 @@ def test_scaler_torchscript(tmpdir):
         scaler = torch.jit.load(tmpdir / "scaler.pt")
 
     scaler(systems, fake_output)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("fixed_scaling_weights", [False, True])
+def test_scaler_spherical_atom_pair_atomic_basis(batch_size, fixed_scaling_weights):
+    """Test scaling weights for a spherical atomic-basis per-atom-pair target.
+
+    We use two small synthetic structures, each with one H (Z=1) and one C (Z=6).
+    Only H→C and C→H pair blocks carry data; H→H and C→C have no samples.
+
+    With atomic_types=[1, 6]:
+      type_pair_to_index ordering: (1,1)→0, (1,6)→1, (6,1)→2, (6,6)→3
+
+    Training data (L=0 scalar value per pair):
+      System 0: H→C = 3.0, C→H = 4.0
+      System 1: H→C = 5.0, C→H = 4.0
+
+    Expected full scales (sqrt of uncentered variance):
+      scale(1,6) = sqrt((3² + 5²) / 2) = sqrt(17)
+      scale(6,1) = sqrt((4² + 4²) / 2) = 4.0
+      scale(1,1) = scale(6,6) = 1.0   (no data → NaN → 1.0)
+
+    This target has 4 key blocks (one per type pair), so it is classified as a
+    multi-property target and ``fit_per_property`` is always called.  The per-property
+    correction re-normalises each pair's scale to the true data RMS, which means the
+    final full scales are identical regardless of whether ``fixed_scaling_weights`` is
+    used.  When ``fixed_scaling_weights=True`` (fixed per-target scale of 2.0), this
+    is verified separately via ``per_target_scales``.
+
+    :param batch_size: number of structures per training batch.
+    :param fixed_scaling_weights: whether to supply a fixed per-target scale (2.0)
+        instead of computing it from the data.
+    """
+    systems = [
+        System(
+            positions=torch.tensor(
+                [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]], dtype=torch.float64
+            ),
+            types=torch.tensor([1, 6]),  # atom 0 = H, atom 1 = C
+            cell=torch.zeros(3, 3, dtype=torch.float64),
+            pbc=torch.tensor([False, False, False]),
+        ),
+        System(
+            positions=torch.tensor(
+                [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]], dtype=torch.float64
+            ),
+            types=torch.tensor([1, 6]),  # atom 0 = H, atom 1 = C
+            cell=torch.zeros(3, 3, dtype=torch.float64),
+            pbc=torch.tensor([False, False, False]),
+        ),
+    ]
+
+    def make_tensor_map(system_idx, hc_val, ch_val):
+        """Build a sparse TensorMap with only the H→C and C→H pair blocks.
+
+        Properties use the names produced by the "coupled" product of two L=0
+        irreps: ``["l_1", "l_2", "n_1", "n_2"]`` with value ``[0, 0, 0, 0]``.
+        This matches the layout so the scaler's forward() property assertion holds.
+        """
+        # For coupled L=0 × L=0 the property labels are (l_1=0, l_2=0, n_1=0, n_2=0).
+        properties = Labels(
+            names=["l_1", "l_2", "n_1", "n_2"],
+            values=torch.tensor([[0, 0, 0, 0]]),
+        )
+        return TensorMap(
+            keys=Labels(
+                names=[
+                    "o3_lambda",
+                    "o3_sigma",
+                    "first_atom_type",
+                    "second_atom_type",
+                ],
+                values=torch.tensor([[0, 1, 1, 6], [0, 1, 6, 1]]),
+            ),
+            blocks=[
+                TensorBlock(
+                    # H→C edge: first_atom=0 (H), second_atom=1 (C)
+                    values=torch.tensor([[hc_val]], dtype=torch.float64).reshape(
+                        -1, 1, 1
+                    ),
+                    samples=Labels(
+                        names=[
+                            "system",
+                            "first_atom",
+                            "second_atom",
+                            "cell_shift_a",
+                            "cell_shift_b",
+                            "cell_shift_c",
+                        ],
+                        values=torch.tensor([[system_idx, 0, 1, 0, 0, 0]]),
+                    ),
+                    components=[Labels(names=["o3_mu"], values=torch.tensor([[0]]))],
+                    properties=properties,
+                ),
+                TensorBlock(
+                    # C→H edge: first_atom=1 (C), second_atom=0 (H)
+                    values=torch.tensor([[ch_val]], dtype=torch.float64).reshape(
+                        -1, 1, 1
+                    ),
+                    samples=Labels(
+                        names=[
+                            "system",
+                            "first_atom",
+                            "second_atom",
+                            "cell_shift_a",
+                            "cell_shift_b",
+                            "cell_shift_c",
+                        ],
+                        values=torch.tensor([[system_idx, 1, 0, 0, 0, 0]]),
+                    ),
+                    components=[Labels(names=["o3_mu"], values=torch.tensor([[0]]))],
+                    properties=properties,
+                ),
+            ],
+        )
+
+    dataset = Dataset.from_dict(
+        {
+            "system": systems,
+            "pair_basis": [
+                make_tensor_map(0, 3.0, 4.0),
+                make_tensor_map(1, 5.0, 4.0),
+            ],
+        }
+    )
+
+    atomic_types = [1, 6]
+    irreps = {
+        1: [{"o3_lambda": 0, "o3_sigma": 1}],
+        6: [{"o3_lambda": 0, "o3_sigma": 1}],
+    }
+    dataset_info = DatasetInfo(
+        length_unit="angstrom",
+        atomic_types=atomic_types,
+        targets={
+            "pair_basis": get_generic_target_info(
+                "pair_basis",
+                {
+                    "quantity": "",
+                    "unit": "",
+                    "type": {"spherical": {"irreps": irreps, "product": "coupled"}},
+                    "num_subtargets": 1,
+                    "sample_kind": "atom_pair",
+                },
+            )
+        },
+    )
+
+    scaler = Scaler(hypers={}, dataset_info=dataset_info).to(torch.float64)
+    scaler2 = copy.deepcopy(scaler)
+    scaler3 = copy.deepcopy(scaler)
+
+    # Hand-computed expected full scales.
+    #
+    # The target has 4 key blocks (one per type pair), so fit_per_property() is
+    # always called.  The per-property correction normalises each pair's scale to the
+    # true data RMS, so the final full scales are the same regardless of whether
+    # fixed_scaling_weights is used:
+    #   scale(1,1) = 1.0         (no data → NaN → 1.0)
+    #   scale(1,6) = sqrt(17)    (sqrt((3² + 5²) / 2))
+    #   scale(6,1) = 4.0         (sqrt((4² + 4²) / 2))
+    #   scale(6,6) = 1.0         (no data → NaN → 1.0)
+    expected_scales = {
+        (1, 1): torch.tensor(1.0, dtype=torch.float64),
+        (1, 6): torch.tensor(17.0, dtype=torch.float64).sqrt(),
+        (6, 1): torch.tensor(4.0, dtype=torch.float64),
+        (6, 6): torch.tensor(1.0, dtype=torch.float64),
+    }
+
+    fixed_weights_arg = {"pair_basis": 2.0} if fixed_scaling_weights else None
+
+    scaler.train_model(
+        dataset,
+        additive_models=[],
+        batch_size=batch_size,
+        is_distributed=False,
+        fixed_weights=fixed_weights_arg,
+    )
+
+    # Verify scales stored in the model.
+    # For atomic-basis per-atom-pair targets each key block encodes exactly one
+    # type pair via (first_atom_type / second_atom_type).  The per-property
+    # accumulation only fills data for that pair's row, so only the "own" row
+    # carries the true full scale; other rows in the same block are not used by
+    # the forward pass and should not be checked here.
+    for key in scaler.model.scales["pair_basis"].keys:
+        block = scaler.model.scales["pair_basis"].block(key)
+        # block.values has shape (n_pairs, n_properties) = (4, 1)
+        fa = int(key["first_atom_type"])
+        sa = int(key["second_atom_type"])
+        idx = scaler.model.type_pair_to_index[fa, sa].item()
+        torch.testing.assert_close(block.values[idx, 0], expected_scales[(fa, sa)])
+
+    # When fixed_scaling_weights=True the per-target scales should equal the fixed
+    # value (2.0) for all type pairs, before the per-property correction is applied.
+    if fixed_scaling_weights:
+        for key in scaler.model.per_target_scales["pair_basis"].keys:
+            pt_block = scaler.model.per_target_scales["pair_basis"].block(key)
+            for fa, sa in [(1, 1), (1, 6), (6, 1), (6, 6)]:
+                idx = scaler.model.type_pair_to_index[fa, sa].item()
+                torch.testing.assert_close(
+                    pt_block.values[idx, 0],
+                    torch.tensor(2.0, dtype=torch.float64),
+                )
+
+    # Test with 2× and 3× repeated datasets: the RMS is invariant to repetition.
+    scaler2.train_model(
+        [dataset, dataset],
+        additive_models=[],
+        batch_size=batch_size,
+        is_distributed=False,
+        fixed_weights=fixed_weights_arg,
+    )
+    scaler3.train_model(
+        [dataset, dataset, dataset],
+        additive_models=[],
+        batch_size=batch_size,
+        is_distributed=False,
+        fixed_weights=fixed_weights_arg,
+    )
+    for sc in [scaler2, scaler3]:
+        for key in sc.model.scales["pair_basis"].keys:
+            block = sc.model.scales["pair_basis"].block(key)
+            fa = int(key["first_atom_type"])
+            sa = int(key["second_atom_type"])
+            idx = sc.model.type_pair_to_index[fa, sa].item()
+            torch.testing.assert_close(block.values[idx, 0], expected_scales[(fa, sa)])

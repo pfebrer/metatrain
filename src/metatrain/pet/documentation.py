@@ -199,8 +199,15 @@ class TrainerHypers(TypedDict):
 
     However, this hyperparameter allows you to provide your own baselines.
     The value of the hyperparameter should be a dictionary where the keys are the
-    target names, and the values are either (1) a single baseline to be used for
-    all atomic types, or (2) a dictionary mapping atomic types to their baselines.
+    target names, and the values are:
+
+    - A single float applied to all atomic types (or type pairs, for atom-pair
+      targets).
+    - A ``{Z: baseline}`` dict for per-atom targets, mapping each atomic type Z to
+      its baseline.
+    - A nested ``{Z1: {Z2: baseline}}`` dict for per-atom-pair targets only, mapping
+      each ``(Z1, Z2)`` type pair to its baseline.
+
     For example:
 
     - ``atomic_baseline: {"energy": {1: -0.5, 6: -10.0}}`` will fix the energy
@@ -211,19 +218,21 @@ class TrainerHypers(TypedDict):
       all atomic types to -5.0.
     - ``atomic_baseline: {"mtt:dos": 0.0}`` sets the baseline for the "mtt:dos"
       target to 0.0, effectively disabling the atomic baseline for that target.
+    - ``atomic_baseline: {"mtt::matrix_edges::hamiltonian": {1: {6: 0.5}}}`` sets the
+      baseline for the ``(H, C)`` pair of the atom-pair target to 0.5.
 
-    This atomic baseline is substracted from the targets during training, which
+    This atomic baseline is subtracted from the targets during training, which
     avoids the main model needing to learn atomic contributions, and likely makes
     training easier. When the model is used in evaluation mode, the atomic baseline
     is added on top of the model predictions automatically.
 
     .. note::
 
-        This atomic baseline is a per-atom contribution. Therefore, if the property
-        you are predicting is a sum over all atoms (e.g., total energy), the
-        contribution of the atomic baseline to the total property will be the
-        atomic baseline multiplied by the number of atoms of that type in the
-        structure.
+        This atomic baseline is a per-atom (or per-atom-pair) contribution.
+        Therefore, if the property you are predicting is a sum over all atoms
+        (e.g., total energy), the contribution of the atomic baseline to the total
+        property will be the atomic baseline multiplied by the number of atoms of
+        that type in the structure.
     """
     scale_targets: bool = True
     """
@@ -244,6 +253,12 @@ class TrainerHypers(TypedDict):
     This is passed to the ``fixed_weights`` argument of
     :meth:`Scaler.train_model <metatrain.utils.scaler.scaler.Scaler.train_model>`,
     see its documentation to understand exactly what to pass here.
+
+    Accepted value formats per target:
+
+    - A single float applied to all atomic types (or type pairs).
+    - A ``{Z: scale}`` dict for per-atom targets.
+    - A nested ``{Z1: {Z2: scale}}`` dict for per-atom-pair targets.
     """
     per_structure_targets: list[str] = []
     """Targets to calculate per-structure losses and errors on."""

@@ -1,3 +1,4 @@
+import itertools
 import logging
 from typing import Callable, Dict, List, Optional, Sequence, Union
 
@@ -48,7 +49,6 @@ class Scaler(torch.nn.Module):
         self.target_infos = {
             target_name: target_info
             for target_name, target_info in dataset_info.targets.items()
-            if target_info.sample_kind != "atom_pair"
         }
 
         # Initialize the scaler model
@@ -434,7 +434,7 @@ class Scaler(torch.nn.Module):
         self.outputs[target_name] = ModelOutput(
             quantity=target_info.quantity,
             unit=target_info.unit,
-            sample_kind="atom",
+            sample_kind=target_info.sample_kind,
             description=target_info.description,
         )
 
@@ -443,6 +443,14 @@ class Scaler(torch.nn.Module):
         valid_sample_names = [
             ["system"],
             ["system", "atom"],
+            [
+                "system",
+                "first_atom",
+                "second_atom",
+                "cell_shift_a",
+                "cell_shift_b",
+                "cell_shift_c",
+            ],
         ]
 
         if layout.sample_names == valid_sample_names[0]:
@@ -452,6 +460,14 @@ class Scaler(torch.nn.Module):
             samples = Labels(
                 ["atomic_type"], torch.arange(len(self.atomic_types)).reshape(-1, 1)
             )
+
+        elif layout.sample_names == valid_sample_names[2]:
+            n_types = len(self.atomic_types)
+            pair_values = torch.tensor(
+                list(itertools.product(self.atomic_types, repeat=2)),
+                dtype=torch.int32,
+            ).reshape(n_types * n_types, 2)
+            samples = Labels(["first_atomic_type", "second_atomic_type"], pair_values)
 
         else:
             raise ValueError(
