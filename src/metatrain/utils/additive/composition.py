@@ -482,6 +482,11 @@ class CompositionModel(torch.nn.Module):
         :return: ``True`` if the target is compatible with a composition model,
             ``False`` otherwise.
         """
+        # do not fit for atom pair targets
+        if "first_atom" in target_info.layout.sample_names:
+            logging.debug("Composition model will not be fitted for atom pair targets.")
+            return False
+
         # only scalars can have composition contributions
         if not target_info.is_scalar and not target_info.is_spherical:
             logging.debug(

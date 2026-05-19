@@ -1,10 +1,9 @@
-import itertools
 from typing import Callable, Dict, List, Optional, Tuple
 
 import metatensor.torch as mts
 import torch
 from metatensor.torch import Labels, TensorBlock, TensorMap
-from metatomic.torch import System
+from metatomic.torch import NeighborListOptions, System
 
 from ..data import DatasetInfo
 from .target_info import TargetInfo
@@ -93,6 +92,88 @@ def get_per_atom_sample_labels(
         values=sample_values,
     )
     return sample_labels
+
+
+def get_per_atom_pair_sample_labels(
+    systems: List[System],
+    sample_labels: Labels,
+    nl_options: NeighborListOptions,
+) -> Labels:
+    """
+    Create per-pair sample labels from center and neighbor atom indices and cell shifts.
+
+    Each row in the returned Labels corresponds to one directed edge (center → neighbor)
+    in the neighbor list, identified in the same way as a standard metatensor neighbor
+    list: by system index, center atom index, neighbor atom index, and the integer cell
+    shift vector ``(cell_shift_a, cell_shift_b, cell_shift_c)``.
+
+    :param systems: List of systems in the batch.
+    :param sample_labels: Labels for all atoms in the batch, with dimensions
+        ``["system", "atom"]``, as returned by :func:`systems_to_batch`.
+    :param nl_options: Options for the neighbor list used to enumerate edges.
+    :return: Labels with columns ``["system", "first_atom", "second_atom",
+        "cell_shift_a", "cell_shift_b", "cell_shift_c"]``, shape ``(n_edges, 6)``.
+    """
+    device = systems[0].positions.device
+    nl_values_list: List[torch.Tensor] = []
+    num_edges: List[int] = []
+    node_offsets_list: List[int] = []
+
+    node_counter = 0
+    for system in systems:
+        assert len(system.known_neighbor_lists()) >= 1, "no neighbor list found"
+        neighbor_list = system.get_neighbor_list(nl_options)
+        nl_values = neighbor_list.samples.values
+        nl_values_list.append(nl_values)
+
+        system_size = len(system)
+        node_offsets_list.append(node_counter)
+        num_edges.append(nl_values.shape[0])
+        node_counter += system_size
+
+    nl_values = torch.cat(nl_values_list)
+    centers = nl_values[:, 0]
+    neighbors = nl_values[:, 1]
+    cell_shifts = nl_values[:, 2:]
+
+    # Compute the offsets
+    total_edges = sum(num_edges)
+    num_edges_tensor = torch.tensor(num_edges, device=device, dtype=torch.long)
+    node_offsets = torch.tensor(node_offsets_list, device=device, dtype=torch.long)
+    edge_offsets = torch.repeat_interleave(
+        node_offsets, num_edges_tensor, output_size=total_edges
+    ).to(dtype=centers.dtype)
+
+    # Offset the centers and neighbors
+    centers = centers + edge_offsets
+    neighbors = neighbors + edge_offsets
+
+    sample_values = sample_labels.values  # (n_atoms, 2): [system, atom]
+    center_values = sample_values[centers]  # (n_edges, 2): [system, first_atom]
+    neighbor_values = sample_values[neighbors]  # (n_edges, 2): [system, second_atom]
+
+    pair_values = torch.cat(
+        [
+            center_values[:, :1],  # system        (n_edges, 1)
+            center_values[:, 1:],  # first_atom    (n_edges, 1)
+            neighbor_values[:, 1:],  # second_atom   (n_edges, 1)
+            cell_shifts,  # a, b, c       (n_edges, 3)
+        ],
+        dim=1,
+    )
+
+    return Labels(
+        names=[
+            "system",
+            "first_atom",
+            "second_atom",
+            "cell_shift_a",
+            "cell_shift_b",
+            "cell_shift_c",
+        ],
+        values=pair_values,
+        assume_unique=True,
+    )
 
 
 # ===== Densification utilities (keys with atom types to samples)
@@ -236,6 +317,93 @@ def densify_atomic_basis_target(
     )
 
 
+def _pad_block(
+    block: TensorBlock,
+    axis: str,
+    padded_labels: Labels,
+    fill_value: float,
+) -> TensorBlock:
+    """
+    Takes a TensorBlock and pads it along the specified axis with zeros, using the
+    provided padded_labels to determine the metadata structure of the new block.
+
+    Any of the samples/properties that are already present in the block will be filled
+    with the original values, while the new samples/properties will be filled with
+    zeros.
+
+    :param block: The TensorBlock to pad.
+    :param axis: Either ``"samples"`` or ``"properties"``, specifying which axis to
+        pad.
+    :param padded_labels: The target Labels defining the full (padded) extent of the
+        chosen axis.
+    :param fill_value: Value used to fill positions that have no corresponding entry
+        in the original block.
+    :return: A new TensorBlock padded to the requested shape along the chosen axis.
+    """
+
+    def get_idxs_pad_idxs_original(
+        padded_labels: Labels, original_labels: Labels
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # First find the intersection
+        intersection = padded_labels.intersection(original_labels)
+        # Get the indices of the intersection in the padded_labels
+        nonzero_idxs_padded = padded_labels.select(intersection)
+        # Get the indices of the intersection in the original_labels
+        nonzero_idxs_original = original_labels.select(intersection)
+
+        return nonzero_idxs_padded, nonzero_idxs_original
+
+    if axis == "samples":
+        samples = padded_labels
+        properties = block.properties
+
+        block_values = torch.full(
+            (len(samples), *[len(c) for c in block.components], len(properties)),
+            fill_value=fill_value,
+            dtype=block.values.dtype,
+        )
+        nonzero_idxs_padded, nonzero_idxs_original = get_idxs_pad_idxs_original(
+            samples, block.samples
+        )
+        assert len(nonzero_idxs_padded) == len(nonzero_idxs_original)
+        if len(nonzero_idxs_original) > 0:
+            block_values[nonzero_idxs_padded] = block.values[nonzero_idxs_original]
+
+    else:
+        assert axis == "properties"
+        samples = block.samples
+        properties = padded_labels
+
+        block_values = (
+            torch.ones(
+                (len(samples), *[len(c) for c in block.components], len(properties)),
+                like=block.values,
+            )
+            * fill_value
+        )
+
+        block_values = torch.full(
+            (len(samples), *[len(c) for c in block.components], len(properties)),
+            fill_value=fill_value,
+            dtype=block.values.dtype,
+        )
+        nonzero_idxs_padded, nonzero_idxs_original = get_idxs_pad_idxs_original(
+            properties, block.properties
+        )
+        assert len(nonzero_idxs_padded) == len(nonzero_idxs_original)
+        if len(nonzero_idxs_original) > 0:
+            block_values[..., nonzero_idxs_padded] = block.values[
+                ..., nonzero_idxs_original
+            ]
+
+    return TensorBlock(
+        samples=samples,
+        components=block.components,
+        properties=properties,
+        values=block_values,
+    )
+
+
 def _pad_samples_per_atom_atomic_basis_target(
     systems: List[System],
     tensor: TensorMap,
@@ -243,20 +411,28 @@ def _pad_samples_per_atom_atomic_basis_target(
     sample_labels = get_per_atom_sample_labels(systems)
     new_blocks = []
     for block in tensor:
-        new_vals = torch.full(
-            (len(sample_labels), *block.values.shape[1:]),
-            fill_value=torch.nan,
-            dtype=block.values.dtype,
-        )
-        sample_mask = sample_labels.select(block.samples)
-        new_vals[sample_mask] = block.values
-        new_block = TensorBlock(
-            values=new_vals,
-            samples=sample_labels,
-            components=block.components,
-            properties=block.properties,
-        )
-        new_blocks.append(new_block)
+        new_blocks.append(_pad_block(block, "samples", sample_labels, torch.nan))
+
+    return TensorMap(tensor.keys, new_blocks)
+
+
+def _pad_samples_per_atom_pair_atomic_basis_target(
+    systems: List[System],
+    tensor: TensorMap,
+    nl_options: NeighborListOptions,
+) -> TensorMap:
+    # Build the samples labels
+    sample_labels = get_per_atom_sample_labels(systems)
+    pair_sample_labels = get_per_atom_pair_sample_labels(
+        systems,
+        sample_labels,
+        nl_options,
+    )
+
+    # Pad the samples according to the neighborlist pair samples
+    new_blocks = []
+    for block in tensor:
+        new_blocks.append(_pad_block(block, "samples", pair_sample_labels, torch.nan))
 
     return TensorMap(tensor.keys, new_blocks)
 
@@ -264,13 +440,16 @@ def _pad_samples_per_atom_atomic_basis_target(
 def pad_samples_atomic_basis_target(
     systems: List[System],
     tensor: TensorMap,
+    nl_options: NeighborListOptions,
 ) -> TensorMap:
     """
     Pad the samples of the atomic basis target to have the same number of samples for
     each block.
 
-    :param systems: List of systems in the batch
+    :param systems: List of systems in the batch.
     :param tensor: the atomic basis target TensorMap to pad.
+    :param nl_options: Options for the neighbor list used to enumerate edges for
+        per-atom-pair targets.
 
     :return: the padded atomic basis target TensorMap
     """
@@ -278,7 +457,9 @@ def pad_samples_atomic_basis_target(
     if "atom" in tensor.sample_names:
         return _pad_samples_per_atom_atomic_basis_target(systems, tensor)
     elif "first_atom" in tensor.sample_names:
-        return tensor
+        return _pad_samples_per_atom_pair_atomic_basis_target(
+            systems, tensor, nl_options
+        )
     raise NotImplementedError(
         "Currently only padding of per-atom atomic basis targets is implemented."
     )
@@ -289,6 +470,7 @@ def prepare_atomic_basis_targets(
     system_ids: torch.Tensor,
     tensor: TensorMap,
     layout: TensorMap,
+    nl_options: Optional[NeighborListOptions] = None,
     fill_value: float = torch.nan,
 ) -> TensorMap:
     """
@@ -301,6 +483,7 @@ def prepare_atomic_basis_targets(
     :param tensor: the atomic basis target TensorMap to prepare.
     :param layout: the layout TensorMap defining the global basis set (i.e. the union of
         all blocks that should be present in the output).
+    :param nl_options: Options for the neighbor list.
     :param fill_value: the value to use for filling in the padded values when densifying
         and padding. Default is NaN, but can be set to 0 if desired (e.g. for
         classification targets).
@@ -315,7 +498,7 @@ def prepare_atomic_basis_targets(
     tensor = densify_atomic_basis_target(tensor, layout, fill_value)
 
     # Pad samples
-    tensor = pad_samples_atomic_basis_target(systems, tensor)
+    tensor = pad_samples_atomic_basis_target(systems, tensor, nl_options)
 
     return tensor
 
@@ -396,23 +579,27 @@ def _sparsify_per_atom_atomic_basis_target(
         )
 
     device = tensor.device
+    atom_types_batch = atom_types_batch.to(device=device)
 
-    # Sparsify by moving the "atom_type" from the samples to the keys
-    unique_types: list[int] = (
+    unique_types: List[int] = (
         torch.unique(atom_types_batch).to(torch.int64).cpu().tolist()
     )
-    atom_type_masks: Dict[int, torch.Tensor] = {}
-    atom_type_samples: Dict[int, Labels] = {}
 
-    # Compute the samples masks (i.e. get the indices for the atoms
-    # of each type), and build the samples labels. This could be computed
-    # in the dataloader since it only depends on the atom types of the systems.
-    sample_indices = torch.arange(len(atom_types_batch)).to(device=device)
+    # Build per-type boolean masks and sample labels as parallel lists (indexed
+    # by position in unique_types). Using parallel lists avoids Dict[int, Labels]
+    # which may not be supported by all TorchScript backends.
+    sample_indices = torch.arange(len(atom_types_batch), device=device)
+    type_masks: List[torch.Tensor] = []
+    type_samples: List[Labels] = []
+    ref_block = tensor.block_by_id(0)
     for atom_type in unique_types:
-        atom_type_masks[atom_type] = sample_indices[atom_types_batch == atom_type]
-        atom_type_samples[atom_type] = Labels(
-            names=["system", "atom"],
-            values=tensor[0].samples.values[atom_type_masks[atom_type]],
+        mask = sample_indices[atom_types_batch == atom_type]
+        type_masks.append(mask)
+        type_samples.append(
+            Labels(
+                names=["system", "atom"],
+                values=ref_block.samples.values[mask],
+            )
         )
 
     sparse_properties = sparse_properties.to(device=device)
@@ -422,8 +609,8 @@ def _sparsify_per_atom_atomic_basis_target(
     new_keys: list[list[int]] = []
     sparse_blocks: List[TensorBlock] = []
     for key, block in tensor.items():
-        key_values: list[int] = key.values.to(torch.int64).tolist()
-        for atom_type in unique_types:
+        key_values: List[int] = key.values.to(torch.int64).tolist()
+        for i_type, atom_type in enumerate(unique_types):
             new_key = key_values + [atom_type]
 
             # Get the corresponding layout block to know which properties to select
@@ -435,7 +622,7 @@ def _sparsify_per_atom_atomic_basis_target(
             layout_block = sparse_properties.block_by_id(block_position)
 
             # Select samples
-            values = block.values[atom_type_masks[atom_type]]
+            values = block.values[type_masks[i_type]]
             # Select properties
             properties_mask = layout_block.values.ravel()
             # Do block.values[..., properties_mask] in a torchscriptable way.
@@ -451,7 +638,7 @@ def _sparsify_per_atom_atomic_basis_target(
 
             sparse_block = TensorBlock(
                 values=values,
-                samples=atom_type_samples[atom_type],
+                samples=type_samples[i_type],
                 components=block.components,
                 properties=layout_block.properties,
             )
@@ -476,7 +663,16 @@ def _sparsify_per_atom_pair_atomic_basis_target(
     sparse_properties: TensorMap,
     atom_types_batch: Optional[torch.Tensor] = None,
 ) -> TensorMap:
-    """"""
+    """
+    Sparsify the per-atom-pair atomic basis target by creating blocks with explicit
+    "first_atom_type" and "second_atom_type" dimensions.
+
+    :param systems: List of systems in the batch.
+    :param tensor: the atomic basis target TensorMap to sparsify.
+    :param sparse_properties: A TensorMap containing the properties to select.
+    :param atom_types_batch: Optional concatenated atom-type tensor for the batch.
+    :return: the sparsified atomic basis target TensorMap
+    """
     if atom_types_batch is None:
         # Get the atom types for each sample in the batch from the systems
         atom_types_batch = torch.cat(
@@ -485,91 +681,86 @@ def _sparsify_per_atom_pair_atomic_basis_target(
         )
 
     device = tensor.device
+    atom_types_batch = atom_types_batch.to(device=device)
 
-    # Sparsify by moving the "atom_type" from the samples to the keys
-    unique_types: list[int] = (
+    unique_types: List[int] = (
         torch.unique(atom_types_batch).to(torch.int64).cpu().tolist()
     )
-    # atom_type_masks: Dict[int, torch.Tensor] = {}
-    # atom_type_samples: Dict[int, Labels] = {}
-
-    # # Compute the samples masks (i.e. get the indices for the atoms
-    # # of each type), and build the samples labels. This could be computed
-    # # in the dataloader since it only depends on the atom types of the systems.
-    # sample_indices = torch.arange(len(atom_types_batch)).to(device=device)
-    # for first_atom_type, second_atom_type in itertools.product(unique_types, repeat=2):
-    #     atom_type_masks[atom_type] = sample_indices[atom_types_batch == atom_type]
-    #     atom_type_samples[atom_type] = Labels(
-    #         names=["system", "atom"],
-    #         values=tensor[0].samples.values[atom_type_masks[atom_type]],
-    #     )
 
     sparse_properties = sparse_properties.to(device=device)
 
-    # Build the sparsified tensormap by looping over the dense one
-    # and splitting each block into one block per atom type.
-    new_keys: list[list[int]] = []
+    # Pre-compute per-system atom offsets so we can look up types from
+    # atom_types_batch with a single vectorized indexing step.
+    n_systems = len(systems)
+    system_lengths = torch.tensor(
+        [len(s.types) for s in systems], dtype=torch.long, device=device
+    )
+    offsets = torch.zeros(n_systems, dtype=torch.long, device=device)
+    if n_systems > 1:
+        offsets[1:] = torch.cumsum(system_lengths[:-1], dim=0)
+
+    new_keys: List[List[int]] = []
     sparse_blocks: List[TensorBlock] = []
     for key, block in tensor.items():
-        key_values: list[int] = key.values.to(torch.int64).tolist()
+        key_values: List[int] = key.values.to(torch.int64).tolist()
 
-        samples = block.samples
-        for first_atom_type, second_atom_type in itertools.product(
-            unique_types, repeat=2
-        ):
-            # mask = (atom_types_batch[samples["first_atom"]] == first_atom_type) & (atom_types_batch[samples["second_atom"]] == second_atom_type)
+        # samples columns: system(0), first_atom(1), second_atom(2), cell_shift_*(3-5)
+        sample_vals = block.samples.values.long()
+        sys_col = sample_vals[:, 0]
+        first_atom_col = sample_vals[:, 1]
+        second_atom_col = sample_vals[:, 2]
 
-            mask = torch.tensor(
-                [
-                    systems[i_sys].types[first_atom].item() == first_atom_type
-                    and systems[i_sys].types[second_atom].item() == second_atom_type
-                    for i_sys, first_atom, second_atom, *_ in samples.values
-                ]
-            )
-            new_key = key_values + [first_atom_type, second_atom_type]
+        # Vectorized type lookup: avoids per-sample Python loops
+        first_types = atom_types_batch[offsets[sys_col] + first_atom_col]
+        second_types = atom_types_batch[offsets[sys_col] + second_atom_col]
 
-            # Get the corresponding layout block to know which properties to select
-            block_position = sparse_properties.keys.position(new_key)
-            if block_position is None:
-                # This irrep doesn't exist for this atom type in the layout
-                continue
-            assert block_position is not None  # for torchscript
-            layout_block = sparse_properties.block_by_id(block_position)
+        for first_atom_type in unique_types:
+            for second_atom_type in unique_types:
+                mask = (first_types == first_atom_type) & (
+                    second_types == second_atom_type
+                )
+                new_key = key_values + [first_atom_type, second_atom_type]
 
-            # Select samples
-            values = block.values[mask]
-            # Select properties
-            properties_mask = layout_block.values.ravel()
-            # Do block.values[..., properties_mask] in a torchscriptable way.
-            if block.values.ndim == 3:
-                values = values[:, :, properties_mask]
-            elif block.values.ndim == 4:
-                values = values[:, :, :, properties_mask]
-            else:
-                raise ValueError(
-                    "Tensorblocks with more than 2 component dimensions can't be "
-                    "sparsified with the current implementation."
+                block_position = sparse_properties.keys.position(new_key)
+                if block_position is None:
+                    continue
+                assert block_position is not None  # for torchscript
+                layout_block = sparse_properties.block_by_id(block_position)
+
+                # Select samples
+                values = block.values[mask]
+                # Select properties
+                properties_mask = layout_block.values.ravel()
+                # Do block.values[..., properties_mask] in a torchscriptable way.
+                if block.values.ndim == 3:
+                    values = values[:, :, properties_mask]
+                elif block.values.ndim == 4:
+                    values = values[:, :, :, properties_mask]
+                else:
+                    raise ValueError(
+                        "Tensorblocks with more than 2 component dimensions can't be "
+                        "sparsified with the current implementation."
+                    )
+
+                sparse_block = TensorBlock(
+                    values=values,
+                    samples=Labels(
+                        names=[
+                            "system",
+                            "first_atom",
+                            "second_atom",
+                            "cell_shift_a",
+                            "cell_shift_b",
+                            "cell_shift_c",
+                        ],
+                        values=block.samples.values[mask],
+                    ),
+                    components=block.components,
+                    properties=layout_block.properties,
                 )
 
-            sparse_block = TensorBlock(
-                values=values,
-                samples=Labels(
-                    names=[
-                        "system",
-                        "first_atom",
-                        "second_atom",
-                        "cell_shift_a",
-                        "cell_shift_b",
-                        "cell_shift_c",
-                    ],
-                    values=block.samples.values[mask],
-                ),
-                components=block.components,
-                properties=layout_block.properties,
-            )
-
-            new_keys.append(new_key)
-            sparse_blocks.append(sparse_block)
+                new_keys.append(new_key)
+                sparse_blocks.append(sparse_block)
 
     tensor = TensorMap(
         Labels(
@@ -585,7 +776,7 @@ def _sparsify_per_atom_pair_atomic_basis_target(
 def sparsify_atomic_basis_target(
     systems: List[System],
     tensor: TensorMap,
-    layout: TensorMap,
+    layout: Optional[TensorMap] = None,
     atom_types_batch: Optional[torch.Tensor] = None,
     sparse_properties: Optional[TensorMap] = None,
 ) -> TensorMap:
@@ -597,7 +788,8 @@ def sparsify_atomic_basis_target(
     :param systems: List of systems in the batch.
     :param tensor: the atomic basis target TensorMap to sparsify.
     :param layout: the layout TensorMap defining the global basis set (i.e. the union of
-        all blocks that should be present in the sparsified output).
+        all blocks that should be present in the sparsified output). Required if
+        ``sparse_properties`` is not provided.
     :param atom_types_batch: Optional tensor containing the atom types for each sample
         in the batch. If not provided, these are inferred from the systems.
     :param sparse_properties: A TensorMap containing the properties to select
@@ -607,6 +799,8 @@ def sparsify_atomic_basis_target(
     :return: the sparsified atomic basis target TensorMap
     """
     if sparse_properties is None:
+        if layout is None:
+            raise ValueError("Either `layout` or `sparse_properties` must be provided.")
         sparse_properties = _compute_sparse_properties(layout)
 
     if "atom" in tensor.sample_names:
@@ -685,6 +879,7 @@ def get_reindex_to_batch_index_transform(
 def get_prepare_atomic_basis_targets_transform(
     target_info_dict: dict[str, TargetInfo],
     extra_data_info_dict: dict[str, TargetInfo],
+    nl_options: Optional[NeighborListOptions] = None,
 ) -> Tuple[Callable, Callable]:
     """
     Get a function that prepares the atomic basis targets for batching by reindexing to
@@ -693,6 +888,8 @@ def get_prepare_atomic_basis_targets_transform(
     :param target_info_dict: Dictionary mapping target names to TargetInfo objects.
     :param extra_data_info_dict: Dictionary mapping extra data names to TargetInfo
         objects.
+    :param nl_options: Options for the neighbor list used to enumerate edges for
+        per-atom-pair targets.
 
     :return: A function that takes in systems, targets and extra data, and returns the
         systems, targets and extra data with prepared atomic basis targets.
@@ -726,6 +923,7 @@ def get_prepare_atomic_basis_targets_transform(
                     system_ids,
                     tensor,
                     target_info_dict[name].layout,
+                    nl_options,
                     fill_value=torch.nan,
                 )
 
@@ -746,6 +944,7 @@ def get_prepare_atomic_basis_targets_transform(
                     system_ids,
                     tensor,
                     extra_data_info_dict[name].layout,
+                    nl_options,
                     fill_value=torch.nan,
                 )
 

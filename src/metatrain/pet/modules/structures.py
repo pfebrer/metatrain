@@ -133,6 +133,10 @@ def systems_to_batch(
     Labels,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
 ]:
     """
     Converts a list of systems to a batch required for the PET model.
@@ -168,6 +172,19 @@ def systems_to_batch(
             from the autograd graph). With adaptive cutoff active this is
             the per-atom adapted cutoff; otherwise every entry equals
             ``options.cutoff``. Always shape ``(num_nodes,)``.
+        - `centers`: Flat tensor of center atom global indices for each real
+          (non-padded) edge, shape ``(n_edges,)``. Suitable for use with
+          :func:`get_pair_sample_labels`.
+        - `neighbors`: Flat tensor of neighbor atom global indices for each real
+          (non-padded) edge, shape ``(n_edges,)``. Suitable for use with
+          :func:`get_pair_sample_labels`.
+        - `nef_to_edges_neighbor`: Index tensor of shape ``(n_edges,)`` such that
+          `nef_tensor[centers, nef_to_edges_neighbor]` recovers the flat edge array
+          from a NEF-format tensor. Needed to flatten 3D (edge-like) hook outputs back
+          to per-edge arrays for TensorMap construction.
+        - `cell_shifts`: Integer cell shift vectors for each real (non-padded) edge,
+          shape ``(n_edges, 3)``. Columns correspond to ``(cell_shift_a, cell_shift_b,
+          cell_shift_c)``. Suitable for use with :func:`get_pair_sample_labels`.
 
     """
     (
@@ -318,4 +335,8 @@ def systems_to_batch(
         sample_labels,
         species,
         atomic_cutoffs_stats,
+        centers,
+        neighbors,
+        nef_to_edges_neighbor,
+        cell_shifts,
     )

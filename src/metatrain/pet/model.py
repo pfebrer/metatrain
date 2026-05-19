@@ -21,7 +21,9 @@ from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import ZBL, CompositionModel
 from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atomic_basis_helpers import (
+    _compute_sparse_properties,
     densify_atomic_basis_dataset_info,
+    get_per_atom_pair_sample_labels,
     sparsify_atomic_basis_target,
 )
 from metatrain.utils.dtype import dtype_to_str
@@ -59,6 +61,7 @@ class PET(ModelInterface[ModelHypers]):
         references={"architecture": ["https://arxiv.org/abs/2305.19302v3"]}
     )
     component_labels: Dict[str, List[List[Labels]]]
+    target_sparse_properties: Dict[str, TensorMap]
     NUM_FEATURE_TYPES: int = 2  # node + edge features
 
     def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
@@ -84,6 +87,7 @@ class PET(ModelInterface[ModelHypers]):
         self.normalization = self.hypers["normalization"]
         self.activation = self.hypers["activation"]
         self.attention_temperature = self.hypers["attention_temperature"]
+        self.cutoff_cm_scaler = self.hypers["cutoff_cm_scaler"]
         self.transformer_type = self.hypers["transformer_type"]
         self.featurizer_type = self.hypers["featurizer_type"]
 
@@ -170,6 +174,14 @@ class PET(ModelInterface[ModelHypers]):
             ),
         }
 
+        # Store the properties of atomic basis targets in the sparse representation
+        self.target_sparse_properties: Dict[str, TensorMap] = {}
+        for target_name, target_info in dataset_info.targets.items():
+            if target_info.is_atomic_basis:
+                self.target_sparse_properties[target_name] = _compute_sparse_properties(
+                    target_info.layout
+                )
+
         # Modified dataset_info with the targets as they will be seen by PET
         # during training.
         train_dataset_info = self._train_dataset_info(dataset_info)
@@ -248,7 +260,13 @@ class PET(ModelInterface[ModelHypers]):
         self.additive_models = torch.nn.ModuleList(additive_models)
 
         # scaler: this is also handled by the trainer at training time
-        self.scaler = Scaler(hypers={}, dataset_info=train_dataset_info)
+        self.scaler = Scaler(
+            hypers={},
+            dataset_info=train_dataset_info,
+            per_property_for_atom_pair_targets=self.hypers[
+                "per_property_for_atom_pair_targets"
+            ],
+        )
 
         self.single_label = Labels.single()
 
@@ -275,6 +293,14 @@ class PET(ModelInterface[ModelHypers]):
                 f"New atomic types found in the dataset: {new_atomic_types}. "
                 "The PET model does not support adding new atomic types."
             )
+
+        # Store the properties of atomic basis targets in the sparse representation
+        self.target_sparse_properties: Dict[str, TensorMap] = {}
+        for target_name, target_info in dataset_info.targets.items():
+            if target_info.is_atomic_basis:
+                self.target_sparse_properties[target_name] = _compute_sparse_properties(
+                    target_info.layout
+                )
 
         # Modified dataset_info with the targets as they will be seen by PET
         # during training.
@@ -443,6 +469,10 @@ class PET(ModelInterface[ModelHypers]):
                 sample_labels,
                 species,
                 atomic_cutoffs_stats,
+                centers,
+                neighbors,
+                nef_to_edges_neighbor,
+                cell_shifts,
             ) = systems_to_batch(
                 systems,
                 nl_options,
@@ -452,6 +482,11 @@ class PET(ModelInterface[ModelHypers]):
                 self.cutoff_width,
                 self.num_neighbors_adaptive,
                 self.adaptive_cutoff_method,
+            )
+            pair_sample_labels = get_per_atom_pair_sample_labels(
+                systems,
+                sample_labels,
+                nl_options,
             )
 
         if "mtt::aux::cutoff_stats" in outputs:
@@ -541,6 +576,8 @@ class PET(ModelInterface[ModelHypers]):
                     padding_mask,
                     cutoff_factors,
                     outputs,
+                    centers,
+                    nef_to_edges_neighbor,
                 )
             )
             atomic_predictions_dict = self._get_output_atomic_predictions(
@@ -550,6 +587,7 @@ class PET(ModelInterface[ModelHypers]):
                 edge_vectors,
                 system_indices,
                 sample_labels,
+                pair_sample_labels,
                 outputs,
                 selected_atoms,
             )
@@ -617,12 +655,12 @@ class PET(ModelInterface[ModelHypers]):
                 # For atomic basis targets, sparsify to create blocks with "atom_type"
                 # in the key dimensions, and ensure properties are unpadded.
                 for k in atomic_predictions_dict.keys():
-                    if self.dataset_info.targets[k].is_atomic_basis:
+                    if k in self.target_sparse_properties:
                         return_dict[k] = sparsify_atomic_basis_target(
                             systems,
                             return_dict[k],
-                            self.dataset_info.targets[k].layout,
-                            species,
+                            sparse_properties=self.target_sparse_properties[k],
+                            atom_types_batch=species,
                         )
 
         return return_dict
@@ -1021,6 +1059,8 @@ class PET(ModelInterface[ModelHypers]):
         padding_mask: torch.Tensor,
         cutoff_factors: torch.Tensor,
         outputs: Dict[str, ModelOutput],
+        centers: torch.Tensor,
+        nef_to_edges_neighbor: torch.Tensor,
     ) -> Tuple[
         Dict[str, List[List[torch.Tensor]]], Dict[str, List[List[torch.Tensor]]]
     ]:
@@ -1038,6 +1078,10 @@ class PET(ModelInterface[ModelHypers]):
         :param cutoff_factors: Tensor of cutoff factors for edge distances
             [n_atoms, max_num_neighbors].
         :param outputs: Dictionary of requested outputs.
+        :param centers: Tensor of center atom indices for each edge
+            [n_atoms, max_num_neighbors].
+        :param nef_to_edges_neighbor: Tensor mapping node-edge-feature indices to
+            neighbor atom indices [n_atoms, max_num_neighbors].
         :return: Tuple of two dictionaries:
             - Dictionary mapping output names to lists of lists of node atomic
               prediction tensors (one list per GNN layer, one tensor per block)
@@ -1093,11 +1137,15 @@ class PET(ModelInterface[ModelHypers]):
                         edge_atomic_predictions = torch.where(
                             ~expanded_padding_mask, 0.0, edge_atomic_predictions
                         )
-                        edge_atomic_predictions_by_block.append(
-                            (edge_atomic_predictions * cutoff_factors[:, :, None]).sum(
-                                dim=1
+                        if self.outputs[output_name].sample_kind == "atom_pair":
+                            edge_atomic_predictions_by_block.append(
+                                edge_atomic_predictions[centers, nef_to_edges_neighbor]
                             )
-                        )
+                        else:
+                            edge_atomic_predictions *= cutoff_factors[:, :, None]
+                            edge_atomic_predictions_by_block.append(
+                                edge_atomic_predictions.sum(dim=1)
+                            )
                     edge_atomic_predictions_dict[output_name].append(
                         edge_atomic_predictions_by_block
                     )
@@ -1112,6 +1160,7 @@ class PET(ModelInterface[ModelHypers]):
         edge_vectors: torch.Tensor,
         system_indices: torch.Tensor,
         sample_labels: Labels,
+        pair_sample_labels: Labels,
         outputs: Dict[str, ModelOutput],
         selected_atoms: Optional[Labels],
     ) -> Dict[str, TensorMap]:
@@ -1131,6 +1180,9 @@ class PET(ModelInterface[ModelHypers]):
         :param system_indices: Tensor mapping each atom to its system index
             [n_atoms].
         :param sample_labels: Labels for all atoms in the batch [n_atoms, 2].
+        :param pair_sample_labels: Labels for all directed edges in the batch,
+            with columns ``["system", "first_atom", "second_atom", "cell_shift_a",
+            "cell_shift_b", "cell_shift_c"]``.
         :param outputs: Dictionary of requested outputs.
         :param selected_atoms: Optional Labels specifying a subset of atoms to include.
         :return: Dictionary mapping requested output names to TensorMaps of
@@ -1158,9 +1210,16 @@ class PET(ModelInterface[ModelHypers]):
                     for j, key in enumerate(atomic_predictions_by_block):
                         node_atomic_predictions = node_atomic_prediction_block[j]
                         edge_atomic_predictions = edge_atomic_prediction_block[j]
-                        atomic_predictions_by_block[key] = atomic_predictions_by_block[
-                            key
-                        ] + (node_atomic_predictions + edge_atomic_predictions)
+                        if self.outputs[output_name].sample_kind == "atom_pair":
+                            atomic_predictions_by_block[key] = (
+                                atomic_predictions_by_block[key]
+                                + edge_atomic_predictions
+                            )
+                        else:
+                            atomic_predictions_by_block[key] = (
+                                atomic_predictions_by_block[key]
+                                + (node_atomic_predictions + edge_atomic_predictions)
+                            )
 
                 if output_name == "non_conservative_stress":  # TODO: variants
                     block_key = list(atomic_predictions_by_block.keys())[0]
@@ -1179,7 +1238,9 @@ class PET(ModelInterface[ModelHypers]):
                 blocks = [
                     TensorBlock(
                         values=atomic_predictions_by_block[key].reshape([-1] + shape),
-                        samples=sample_labels,
+                        samples=pair_sample_labels
+                        if self.outputs[output_name].sample_kind == "atom_pair"
+                        else sample_labels,
                         components=components,
                         properties=properties,
                     )
@@ -1209,7 +1270,7 @@ class PET(ModelInterface[ModelHypers]):
         # to get the final per-structure predictions for each requested output.
 
         for output_name, atomic_property in atomic_predictions_tmap_dict.items():
-            if outputs[output_name].sample_kind == "atom":
+            if outputs[output_name].sample_kind in ["atom", "atom_pair"]:
                 atomic_predictions_tmap_dict[output_name] = atomic_property
             else:
                 atomic_predictions_tmap_dict[output_name] = sum_over_atoms(
@@ -1322,7 +1383,7 @@ class PET(ModelInterface[ModelHypers]):
         self.outputs[target_name] = ModelOutput(
             quantity=target_info.quantity,
             unit=target_info.unit,
-            sample_kind="atom",
+            sample_kind=target_info.sample_kind,
             description=target_info.description,
         )
 

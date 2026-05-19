@@ -8,6 +8,7 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler
 
+from metatomic.torch import NeighborListOptions
 from metatrain.utils.abc import ModelInterface, TrainerInterface
 from metatrain.utils.additive import get_remove_additive_transform
 from metatrain.utils.augmentation import RotationalAugmenter
@@ -178,8 +179,31 @@ class Trainer(TrainerInterface[TrainerHypers]):
             None if max_atoms is not None else self.hypers["batch_atom_bounds"]
         )
         atomic_basis_transform, atomic_basis_reverse_transform = (
-            get_prepare_atomic_basis_targets_transform(train_targets, extra_data_info)
+            get_prepare_atomic_basis_targets_transform(
+                train_targets,
+                extra_data_info,
+                nl_options=model.requested_neighbor_lists()[0],
+            )
         )
+
+        # Build a (possibly reduced-cutoff) NL + transform for CM / scaler fitting.
+        # Using a smaller cutoff avoids polluting scale estimates with the many
+        # near-zero far-range pairs that result from the r² volume element.
+        cutoff_cm_scaler = model.hypers["cutoff_cm_scaler"]
+        if cutoff_cm_scaler is not None:
+            nl_options_cm_scaler = NeighborListOptions(
+                cutoff=float(cutoff_cm_scaler), full_list=True, strict=True
+            )
+            atomic_basis_transform_cm_scaler, _ = (
+                get_prepare_atomic_basis_targets_transform(
+                    train_targets,
+                    extra_data_info,
+                    nl_options=nl_options_cm_scaler,
+                )
+            )
+        else:
+            nl_options_cm_scaler = model.requested_neighbor_lists()[0]
+            atomic_basis_transform_cm_scaler = atomic_basis_transform
 
         logging.info("Calculating composition weights")
         model.additive_models[0].train_model(  # this is the composition model
@@ -188,7 +212,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
             self.hypers["batch_size"],
             is_distributed,
             self.hypers["atomic_baseline"],
-            initial_transforms=[atomic_basis_transform],
+            initial_transforms=[
+                get_system_with_neighbor_lists_transform([nl_options_cm_scaler]),
+                atomic_basis_transform_cm_scaler,
+            ],
         )
 
         if self.hypers["scale_targets"]:
@@ -199,7 +226,10 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 self.hypers["batch_size"],
                 is_distributed,
                 self.hypers["fixed_scaling_weights"],
-                initial_transforms=[atomic_basis_transform],
+                initial_transforms=[
+                    get_system_with_neighbor_lists_transform([nl_options_cm_scaler]),
+                    atomic_basis_transform_cm_scaler,
+                ],
                 per_structure_targets=self.hypers["per_structure_targets"],
             )
 
@@ -247,9 +277,11 @@ class Trainer(TrainerInterface[TrainerHypers]):
         collate_fn_train = CollateFn(
             target_keys=list(train_targets.keys()),
             callables=[
+                # compute NL first as they are needed in atomic_basis_transform
+                # TODO: check whether this is compatible with the augmenter
+                get_system_with_neighbor_lists_transform(requested_neighbor_lists),
                 atomic_basis_transform,
                 rotational_augmenter.apply_random_augmentations,
-                get_system_with_neighbor_lists_transform(requested_neighbor_lists),
                 get_remove_additive_transform(additive_models, train_targets),
                 get_remove_scale_transform(scaler),
             ],
@@ -258,8 +290,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
         collate_fn_val = CollateFn(
             target_keys=list(train_targets.keys()),
             callables=[  # no augmentation for validation
-                atomic_basis_transform,
+                # compute NL first as they are needed in atomic_basis_transform
                 get_system_with_neighbor_lists_transform(requested_neighbor_lists),
+                atomic_basis_transform,
                 get_remove_additive_transform(additive_models, train_targets),
                 get_remove_scale_transform(scaler),
             ],

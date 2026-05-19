@@ -29,12 +29,19 @@ class Scaler(torch.nn.Module):
 
     :param hypers: Hyperparameters for the scaler. Should be an empty dictionary.
     :param dataset_info: Information about the dataset used to initialize the scaler.
+    :param per_property_for_atom_pair_targets: Whether to fit per-property scales for
+        atom-pair targets.
     """
 
     # Needed for torchscript compatibility
     outputs: Dict[str, ModelOutput]
 
-    def __init__(self, hypers: Dict, dataset_info: DatasetInfo):
+    def __init__(
+        self,
+        hypers: Dict,
+        dataset_info: DatasetInfo,
+        per_property_for_atom_pair_targets: bool = True,
+    ):
         super().__init__()
 
         # `hypers` should be an empty dictionary
@@ -58,6 +65,7 @@ class Scaler(torch.nn.Module):
                 target_name: target_info.layout
                 for target_name, target_info in self.target_infos.items()
             },
+            per_property_for_atom_pair_targets=per_property_for_atom_pair_targets,
         )
         self.outputs: Dict[str, ModelOutput] = {}
 

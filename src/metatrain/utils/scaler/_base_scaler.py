@@ -33,6 +33,8 @@ class BaseScaler(torch.nn.Module):
     :param layouts: Dict of zero-sample layout :py:class:`TensorMap` corresponding to
         each target. The keys of the dict are the target names, and the values are
         :py:class:`TensorMap` objects with the zero-sample layout for each target.
+    :param per_property_for_atom_pair_targets: Whether to fit per-property scales for
+        atom-pair targets.
     """
 
     # Needed for torchscript compatibility
@@ -48,10 +50,17 @@ class BaseScaler(torch.nn.Module):
     per_property_scales: Dict[str, TensorMap]  # per-property scales
     per_target_scales: Dict[str, TensorMap]  # per-target scales
     multi_property_target_names: List[str]
+    per_property_for_atom_pair_targets: bool
 
-    def __init__(self, atomic_types: List[int], layouts: Dict[str, TensorMap]) -> None:
+    def __init__(
+        self,
+        atomic_types: List[int],
+        layouts: Dict[str, TensorMap],
+        per_property_for_atom_pair_targets: bool = True,
+    ) -> None:
         super().__init__()
 
+        self.per_property_for_atom_pair_targets = per_property_for_atom_pair_targets
         self.atomic_types = torch.as_tensor(atomic_types, dtype=torch.int32)
         self.target_names = []
         self.sample_kinds = {}
@@ -219,7 +228,9 @@ class BaseScaler(torch.nn.Module):
         )
 
         if len(layout.keys) > 1 or len(layout[0].properties) > 1:
-            self.multi_property_target_names.append(target_name)
+            is_atom_pair = "first_atom" in layout.sample_names
+            if not is_atom_pair or self.per_property_for_atom_pair_targets:
+                self.multi_property_target_names.append(target_name)
 
         # Next, per-property scales. These have a single value per-block and
         # per-property in the target, which is also separately computed for each atomic

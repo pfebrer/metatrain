@@ -148,6 +148,14 @@ class ModelHypers(TypedDict):
     """Activation function."""
     attention_temperature: float = 1.0
     """The temperature scaling factor for attention scores."""
+    per_property_for_atom_pair_targets: bool = True
+    """Whether or not to fit per-property scales for atom-pair targets."""
+    cutoff_cm_scaler: Optional[float] = None
+    """Cutoff radius for neighbor search for fitting the scaler of atom pair targets.
+
+    This is only used if ``use_onsite_scales_for_offsite`` is ``False``. If not
+    provided, it defaults to the same value as ``cutoff``.
+    """
     transformer_type: Literal["PreLN", "PostLN"] = "PreLN"
     """The order in which the layer normalization and attention
     are applied in a transformer block. Available options are ``PreLN``

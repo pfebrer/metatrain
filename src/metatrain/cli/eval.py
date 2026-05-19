@@ -22,6 +22,9 @@ from metatrain.utils.data import (
     read_systems,
     unpack_batch,
 )
+from metatrain.utils.data.atomic_basis_helpers import (
+    get_prepare_atomic_basis_targets_transform,
+)
 from metatrain.utils.data.writers import (
     DiskDatasetWriter,
     Writer,
@@ -176,9 +179,31 @@ def _eval_targets(
     # Create a dataloader
     target_keys = list(model.capabilities().outputs.keys())
     requested_neighbor_lists = get_requested_neighbor_lists(model)
+
+    eval_callables = [
+        get_system_with_neighbor_lists_transform(requested_neighbor_lists)
+    ]
+    target_info_dict: Dict[str, TargetInfo] = {}
+    for k, v in options.items():
+        if isinstance(v, TargetInfo):
+            target_info_dict[k] = v
+
+    if any(info.is_atomic_basis for info in target_info_dict.values()):
+        atomic_basis_transform, atomic_basis_reverse_transform = (
+            get_prepare_atomic_basis_targets_transform(
+                target_info_dict,
+                {},
+                nl_options=model.requested_neighbor_lists()[0],
+            )
+        )
+        eval_callables += [
+            atomic_basis_transform,
+            atomic_basis_reverse_transform,
+        ]
+
     collate_fn = CollateFn(
         target_keys,
-        callables=[get_system_with_neighbor_lists_transform(requested_neighbor_lists)],
+        callables=eval_callables,
     )
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False
