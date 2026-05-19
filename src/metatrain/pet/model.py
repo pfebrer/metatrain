@@ -266,6 +266,7 @@ class PET(ModelInterface[ModelHypers]):
             per_property_for_atom_pair_targets=self.hypers[
                 "per_property_for_atom_pair_targets"
             ],
+            use_onsite_scales_for_offsite=self.hypers["use_onsite_scales_for_offsite"],
         )
 
         self.single_label = Labels.single()

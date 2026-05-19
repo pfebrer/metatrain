@@ -964,6 +964,266 @@ class BaseScaler(torch.nn.Module):
 
         return predictions
 
+    def apply_onsite_scales_for_offsite(
+        self,
+        node_target_name: str,
+        edge_target_name: str,
+    ) -> None:
+        """
+        Override the per-target (and per-property, when applicable) scales of an
+        edge (atom-pair) target using the Wolfsberg–Helmholtz geometric-mean proxy
+        derived from the corresponding per-atom (node) target's scales.
+
+        **Coupled basis** (non-``atom_type`` key names include ``o3_lambda`` and
+        ``o3_sigma``): every edge block uses the invariant
+        ``(o3_lambda=0, o3_sigma=1)`` node block as proxy for per-target scales.
+        Per-property scales are looked up by replacing all ``_2``-suffixed property
+        dimension values with the matching ``_1``-suffixed values (Z_I contribution)
+        and vice-versa (Z_J contribution), then taking the geometric mean.
+
+        **Uncoupled basis** (other non-``atom_type`` key structures, e.g.
+        ``["l_1", "l_2", …]``): for an edge block with physics keys
+        ``(k_1=A, k_2=B, …)`` the diagonal node blocks ``(k_1=A, k_2=A, …)``
+        and ``(k_1=B, k_2=B, …)`` are used for Z_I and Z_J respectively.  The
+        same ``_1``/``_2`` replacement logic applies for per-property scales.
+
+        Must be called after :meth:`fit` and :meth:`fit_per_property`.
+
+        :param node_target_name: Name of the per-atom (node) target.
+        :param edge_target_name: Name of the per-atom-pair (edge) target.
+        """
+        if node_target_name not in self.target_names:
+            raise ValueError(f"Node target '{node_target_name}' not found in scaler.")
+        if edge_target_name not in self.target_names:
+            raise ValueError(f"Edge target '{edge_target_name}' not found in scaler.")
+
+        node_pt = self.per_target_scales[node_target_name]
+        edge_pt = self.per_target_scales[edge_target_name]
+        node_pp = self.per_property_scales[node_target_name]
+        edge_pp = self.per_property_scales[edge_target_name]
+
+        edge_key_names: List[str] = list(edge_pt.keys.names)
+        node_key_names: List[str] = list(node_pt.keys.names)
+
+        # Physics (non-atom-type) key names for the edge target
+        edge_phys_names: List[str] = [
+            n for n in edge_key_names if not n.endswith("atom_type")
+        ]
+
+        # Detect coupled vs. uncoupled basis
+        is_coupled = "o3_lambda" in edge_phys_names and "o3_sigma" in edge_phys_names
+
+        # For uncoupled: identify _1-suffixed physics key names
+        phys_1_names: List[str] = (
+            [] if is_coupled else [n for n in edge_phys_names if n.endswith("_1")]
+        )
+
+        # Whether we also update per-property scales
+        do_per_property = edge_target_name in self.multi_property_target_names
+
+        # Identify _1/_2 property dimension pairs (for the per-property proxy)
+        prop_pair_bases: List[str] = []
+        prop_cols_1: Dict[str, int] = {}
+        prop_cols_2: Dict[str, int] = {}
+        if do_per_property and len(edge_pt.keys) > 0:
+            first_block = edge_pt.block_by_id(0)
+            edge_prop_names: List[str] = list(first_block.properties.names)
+            for pname in edge_prop_names:
+                if pname.endswith("_1"):
+                    base = pname[:-2]
+                    if base + "_2" in edge_prop_names:
+                        prop_pair_bases.append(base)
+                        prop_cols_1[base] = edge_prop_names.index(pname)
+                        prop_cols_2[base] = edge_prop_names.index(base + "_2")
+
+        # Build new per-target and per-property scale blocks for the edge target.
+        # The outer loop is over blocks (one per physics key); the inner loop is
+        # over sample rows (type pairs).  This handles both sparsified targets
+        # (where first_atom_type / second_atom_type appear in the block keys) and
+        # densified targets (where they appear only in the sample labels).
+        new_pt_blocks: List[TensorBlock] = []
+        new_pp_blocks: List[TensorBlock] = []
+
+        for edge_key in edge_pt.keys:
+            edge_pt_block = edge_pt.block(edge_key)
+            edge_pp_block = edge_pp.block(edge_key)
+
+            # Physics key values from this edge block (no atom-type dims)
+            edge_phys_vals: Dict[str, int] = {
+                n: int(edge_key[n]) for n in edge_phys_names
+            }
+
+            # For uncoupled: compute the diagonal physics-key substitutions once
+            # per edge block (they depend on the physics key, not on the type pair).
+            if not is_coupled:
+                node_phys_for_I: Dict[str, int] = dict(edge_phys_vals)
+                node_phys_for_J: Dict[str, int] = dict(edge_phys_vals)
+                for n1 in phys_1_names:
+                    n2 = n1[:-2] + "_2"
+                    if n2 in edge_phys_vals:
+                        node_phys_for_I[n2] = edge_phys_vals[n1]  # _2 ← _1
+                        node_phys_for_J[n1] = edge_phys_vals[n2]  # _1 ← _2
+
+            # For the per-property proxy, the property index mapping is the same
+            # for all type pairs, so precompute it once per edge block.
+            if do_per_property:
+                edge_pp_props = edge_pp_block.properties
+                n_edge_props = len(edge_pp_props)
+                edge_prop_vals_tensor = edge_pp_props.values  # (n_props, n_dims)
+
+                # For each edge property build the "diagonal" node property
+                # indices: Z_I uses (_1 repeated), Z_J uses (_2 repeated).
+                node_prop_I_list: List[List[int]] = []
+                node_prop_J_list: List[List[int]] = []
+                for p_idx in range(n_edge_props):
+                    prop_row: List[int] = edge_prop_vals_tensor[p_idx].tolist()
+                    npi: List[int] = list(prop_row)
+                    npj: List[int] = list(prop_row)
+                    for base in prop_pair_bases:
+                        npi[prop_cols_2[base]] = prop_row[prop_cols_1[base]]
+                        npj[prop_cols_1[base]] = prop_row[prop_cols_2[base]]
+                    node_prop_I_list.append(npi)
+                    node_prop_J_list.append(npj)
+
+            # Start with clones of the existing values; we will overwrite
+            # individual rows as we iterate over type pairs.
+            new_pt_vals = edge_pt_block.values.clone()
+            new_pp_vals = edge_pp_block.values.clone() if do_per_property else None
+
+            # ---- Inner loop: one update per type pair (sample row) ----
+            for sample_idx, sample_entry in enumerate(edge_pt_block.samples):
+                Z_I = int(sample_entry["first_atomic_type"])
+                Z_J = int(sample_entry["second_atomic_type"])
+                i_I = int(self.type_to_index[Z_I].item())
+                i_J = int(self.type_to_index[Z_J].item())
+
+                # Determine node block key for Z_I and Z_J
+                if is_coupled:
+                    node_key_vals_I: List[int] = []
+                    node_key_vals_J: List[int] = []
+                    for n in node_key_names:
+                        if n == "o3_lambda":
+                            node_key_vals_I.append(0)
+                            node_key_vals_J.append(0)
+                        elif n == "o3_sigma":
+                            node_key_vals_I.append(1)
+                            node_key_vals_J.append(1)
+                        elif n == "atom_type":
+                            node_key_vals_I.append(Z_I)
+                            node_key_vals_J.append(Z_J)
+                        else:
+                            node_key_vals_I.append(0)
+                            node_key_vals_J.append(0)
+                else:
+                    node_key_vals_I = [
+                        Z_I
+                        if n == "atom_type"
+                        else node_phys_for_I.get(n, edge_phys_vals.get(n, 1))
+                        for n in node_key_names
+                    ]
+                    node_key_vals_J = [
+                        Z_J
+                        if n == "atom_type"
+                        else node_phys_for_J.get(n, edge_phys_vals.get(n, 1))
+                        for n in node_key_names
+                    ]
+
+                pos_I = node_pt.keys.position(node_key_vals_I)
+                pos_J = node_pt.keys.position(node_key_vals_J)
+
+                if pos_I is None or pos_J is None:
+                    key_info = dict(
+                        zip(edge_key_names, edge_key.values.tolist(), strict=True)
+                    )
+                    logging.warning(
+                        "onsite_scales_for_offsite: could not find node block "
+                        f"for (Z_I={Z_I}, Z_J={Z_J}) in edge block {key_info};"
+                        " leaving scales unchanged for this type pair."
+                    )
+                    continue  # leave this row unchanged (clone keeps old value)
+
+                node_block_I_pt = node_pt.block_by_id(pos_I)
+                node_block_J_pt = node_pt.block_by_id(pos_J)
+
+                # Per-target proxy (uniform across all properties in the block)
+                s_I = node_block_I_pt.values[i_I, 0]
+                s_J = node_block_J_pt.values[i_J, 0]
+                new_pt_vals[sample_idx, :] = torch.sqrt(s_I.abs() * s_J.abs())
+
+                # Per-property proxy
+                if do_per_property and new_pp_vals is not None:
+                    node_block_I_pp = node_pp.block_by_id(pos_I)
+                    node_block_J_pp = node_pp.block_by_id(pos_J)
+
+                    pp_proxy = torch.ones(
+                        n_edge_props,
+                        dtype=edge_pp_block.values.dtype,
+                        device=edge_pp_block.values.device,
+                    )
+                    if len(prop_pair_bases) > 0:
+                        for p_idx in range(n_edge_props):
+                            idx_I_pp = node_block_I_pp.properties.position(
+                                node_prop_I_list[p_idx]
+                            )
+                            idx_J_pp = node_block_J_pp.properties.position(
+                                node_prop_J_list[p_idx]
+                            )
+                            if idx_I_pp is not None and idx_J_pp is not None:
+                                s_pp_I = node_block_I_pp.values[i_I, idx_I_pp]
+                                s_pp_J = node_block_J_pp.values[i_J, idx_J_pp]
+                                pp_proxy[p_idx] = torch.sqrt(
+                                    s_pp_I.abs() * s_pp_J.abs()
+                                )
+                            # else: leave as 1.0
+
+                    new_pp_vals[sample_idx, :] = pp_proxy
+
+            new_pt_blocks.append(
+                TensorBlock(
+                    values=new_pt_vals,
+                    samples=edge_pt_block.samples,
+                    components=edge_pt_block.components,
+                    properties=edge_pt_block.properties,
+                )
+            )
+            if do_per_property and new_pp_vals is not None:
+                new_pp_blocks.append(
+                    TensorBlock(
+                        values=new_pp_vals,
+                        samples=edge_pp_block.samples,
+                        components=edge_pp_block.components,
+                        properties=edge_pp_block.properties,
+                    )
+                )
+
+        # ---- Update TensorMaps in-place ----
+        self.per_target_scales[edge_target_name] = TensorMap(
+            edge_pt.keys, new_pt_blocks
+        )
+        if do_per_property:
+            self.per_property_scales[edge_target_name] = TensorMap(
+                edge_pp.keys, new_pp_blocks
+            )
+
+        # Recompute full scales = per_target * per_property
+        current_pp = self.per_property_scales[edge_target_name]
+        new_full_blocks: List[TensorBlock] = []
+        for key in self.per_target_scales[edge_target_name].keys:
+            pt_b = self.per_target_scales[edge_target_name].block(key)
+            pp_b = current_pp.block(key)
+            full_vals = torch.nan_to_num(pt_b.values * pp_b.values, nan=1.0)
+            new_full_blocks.append(
+                TensorBlock(
+                    values=full_vals,
+                    samples=pt_b.samples,
+                    components=pt_b.components,
+                    properties=pt_b.properties,
+                )
+            )
+        self.scales[edge_target_name] = TensorMap(
+            self.per_target_scales[edge_target_name].keys, new_full_blocks
+        )
+
     def _set_fixed_weights(
         self,
         target_name: str,

@@ -31,6 +31,8 @@ class Scaler(torch.nn.Module):
     :param dataset_info: Information about the dataset used to initialize the scaler.
     :param per_property_for_atom_pair_targets: Whether to fit per-property scales for
         atom-pair targets.
+    :param use_onsite_scales_for_offsite: Whether to replace edge target scales with a
+        geometric-mean proxy derived from the corresponding node target scales.
     """
 
     # Needed for torchscript compatibility
@@ -41,6 +43,7 @@ class Scaler(torch.nn.Module):
         hypers: Dict,
         dataset_info: DatasetInfo,
         per_property_for_atom_pair_targets: bool = True,
+        use_onsite_scales_for_offsite: bool = False,
     ):
         super().__init__()
 
@@ -50,6 +53,8 @@ class Scaler(torch.nn.Module):
                 f"{self.__class__.__name__} hypers takes an empty dictionary"
                 f"Got: {hypers}."
             )
+
+        self.use_onsite_scales_for_offsite = use_onsite_scales_for_offsite
 
         self.dataset_info = dataset_info
         self.atomic_types = sorted(dataset_info.atomic_types)
@@ -358,6 +363,62 @@ class Scaler(torch.nn.Module):
                         )
                     ).to(device),
                 )
+
+        # ---- Onsite-scale proxy for edge targets ----
+        if self.use_onsite_scales_for_offsite:
+            self._apply_onsite_scales_for_offsite()
+
+            # Update all three buffer types: the edge per-target, per-property,
+            # and full scales have all been overwritten by the proxy.
+            for target_name in self.model.scales.keys():
+                self.register_buffer(
+                    target_name + "_scaler_buffer",
+                    mts.save_buffer(
+                        mts.make_contiguous(
+                            self.model.scales[target_name].to("cpu", torch.float64)
+                        )
+                    ).to(device),
+                )
+            for target_name in self.model.per_target_scales.keys():
+                self.register_buffer(
+                    target_name + "_per_target_scaler_buffer",
+                    mts.save_buffer(
+                        mts.make_contiguous(
+                            self.model.per_target_scales[target_name].to(
+                                "cpu", torch.float64
+                            )
+                        )
+                    ).to(device),
+                )
+            for target_name in self.model.per_property_scales.keys():
+                self.register_buffer(
+                    target_name + "_per_property_scaler_buffer",
+                    mts.save_buffer(
+                        mts.make_contiguous(
+                            self.model.per_property_scales[target_name].to(
+                                "cpu", torch.float64
+                            )
+                        )
+                    ).to(device),
+                )
+
+    def _apply_onsite_scales_for_offsite(self) -> None:
+        """
+        For every ``mtt::matrix_edges::X`` target that is currently being
+        fitted, check whether a matching ``mtt::matrix_nodes::X`` target exists
+        in the scaler and, if so, overwrite the edge scales with the
+        Wolfsberg–Helmholtz geometric-mean proxy from the node scales.
+
+        Called from :meth:`train_model` after all ordinary fitting is complete.
+        """
+        for edge_name in self.new_outputs:
+            if "::matrix_edges::" not in edge_name:
+                continue
+            node_name = edge_name.replace("::matrix_edges::", "::matrix_nodes::")
+            if node_name not in self.model.target_names:
+                continue
+            logging.info(f"Applying onsite-scale proxy: '{node_name}' → '{edge_name}'")
+            self.model.apply_onsite_scales_for_offsite(node_name, edge_name)
 
     def restart(self, dataset_info: DatasetInfo) -> "Scaler":
         """

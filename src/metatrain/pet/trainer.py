@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union, cast
 
 import torch
+from metatomic.torch import NeighborListOptions
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler
 
-from metatomic.torch import NeighborListOptions
 from metatrain.utils.abc import ModelInterface, TrainerInterface
 from metatrain.utils.additive import get_remove_additive_transform
 from metatrain.utils.augmentation import RotationalAugmenter
