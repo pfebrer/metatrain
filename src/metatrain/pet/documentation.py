@@ -175,16 +175,25 @@ class ModelHypers(TypedDict):
     use_onsite_scales_for_offsite: bool = False
     """Use onsite (node) scales as a proxy for offsite scales.
 
-    When ``True`` and both ``mtt::matrix_nodes::X`` and ``mtt::matrix_edges::X`` targets
-    are present, the per-target (and optionally per-property, depending on hyper
-    ``per_property_for_atom_pair_targets``) scales of each edge target are replaced by
-    the geometric mean ``sqrt(s_I * s_J)``, where ``s_I``, ``s_J`` are the corresponding
-    node scales for atom types Z_I and Z_J.
+    When ``True`` and both ``mtt::matrix_nodes::X`` and ``mtt::matrix_edges::X``
+    targets are present, the per-target (and optionally per-property) scales of
+    each edge target are replaced by a mean of the corresponding node scales for
+    atom types Z_I and Z_J (see :attr:`offsite_proxy_mean`).
 
-    For coupled matrix targets, the invariant ``(lambda=0, sigma=1)`` node block is used
-    as proxy for all edge blocks. For uncoupled targets, diagonal node blocks are used.
-    Set :attr:`per_property_for_atom_pair_targets` to ``False`` to restrict the proxy to
-    per-target scales only.
+    For coupled targets (keys contain ``o3_lambda``/``o3_sigma``), the invariant
+    ``(lambda=0, sigma=1)`` node block is used as proxy for all edge blocks. For
+    uncoupled targets (paired ``_1``/``_2`` dimensions), diagonal node blocks are
+    used. Set :attr:`per_property_for_atom_pair_targets` to ``False`` to restrict
+    the proxy to per-target scales only.
+    """
+    offsite_proxy_mean: Literal["geometric", "arithmetic"] = "geometric"
+    """Aggregation used when computing the onsite-scale proxy for offsite scales.
+
+    ``"geometric"`` uses ``sqrt(s_I * s_J)`` (AM-GM lower bound; gives smaller
+    proxy scales and therefore higher relative edge loss weight).
+    ``"arithmetic"`` uses ``(s_I + s_J) / 2`` (upper bound; gives larger proxy
+    scales and lower relative edge loss weight). Only used when
+    :attr:`use_onsite_scales_for_offsite` is ``True``.
     """
 
 

@@ -968,18 +968,23 @@ class BaseScaler(torch.nn.Module):
         self,
         node_target_name: str,
         edge_target_name: str,
+        mean: str = "geometric",
     ) -> None:
         """
         Override the per-target (and per-property, when applicable) scales of an
-        edge (atom-pair) target using the Wolfsberg–Helmholtz geometric-mean proxy
-        derived from the corresponding per-atom (node) target's scales.
+        edge (atom-pair) target using a proxy derived from the corresponding per-atom
+        (node) target's scales.
+
+        The proxy for a type pair (Z_I, Z_J) is computed as either the geometric mean
+        ``sqrt(s_I * s_J)`` or the arithmetic mean ``(s_I + s_J) / 2`` of the node
+        scales, controlled by the ``mean`` parameter.
 
         **Coupled basis** (non-``atom_type`` key names include ``o3_lambda`` and
         ``o3_sigma``): every edge block uses the invariant
         ``(o3_lambda=0, o3_sigma=1)`` node block as proxy for per-target scales.
         Per-property scales are looked up by replacing all ``_2``-suffixed property
         dimension values with the matching ``_1``-suffixed values (Z_I contribution)
-        and vice-versa (Z_J contribution), then taking the geometric mean.
+        and vice-versa (Z_J contribution).
 
         **Uncoupled basis** (other non-``atom_type`` key structures, e.g.
         ``["l_1", "l_2", …]``): for an edge block with physics keys
@@ -991,7 +996,13 @@ class BaseScaler(torch.nn.Module):
 
         :param node_target_name: Name of the per-atom (node) target.
         :param edge_target_name: Name of the per-atom-pair (edge) target.
+        :param mean: Aggregation function for the proxy. Either ``"geometric"``
+            (``sqrt(s_I * s_J)``) or ``"arithmetic"`` (``(s_I + s_J) / 2``).
         """
+        if mean not in ("geometric", "arithmetic"):
+            raise ValueError(
+                f"offsite_proxy_mean must be 'geometric' or 'arithmetic', got '{mean}'"
+            )
         if node_target_name not in self.target_names:
             raise ValueError(f"Node target '{node_target_name}' not found in scaler.")
         if edge_target_name not in self.target_names:
@@ -1148,7 +1159,10 @@ class BaseScaler(torch.nn.Module):
                 # Per-target proxy (uniform across all properties in the block)
                 s_I = node_block_I_pt.values[i_I, 0]
                 s_J = node_block_J_pt.values[i_J, 0]
-                new_pt_vals[sample_idx, :] = torch.sqrt(s_I.abs() * s_J.abs())
+                if mean == "geometric":
+                    new_pt_vals[sample_idx, :] = torch.sqrt(s_I.abs() * s_J.abs())
+                else:
+                    new_pt_vals[sample_idx, :] = (s_I.abs() + s_J.abs()) / 2
 
                 # Per-property proxy
                 if do_per_property and new_pp_vals is not None:
@@ -1171,9 +1185,12 @@ class BaseScaler(torch.nn.Module):
                             if idx_I_pp is not None and idx_J_pp is not None:
                                 s_pp_I = node_block_I_pp.values[i_I, idx_I_pp]
                                 s_pp_J = node_block_J_pp.values[i_J, idx_J_pp]
-                                pp_proxy[p_idx] = torch.sqrt(
-                                    s_pp_I.abs() * s_pp_J.abs()
-                                )
+                                if mean == "geometric":
+                                    pp_proxy[p_idx] = torch.sqrt(
+                                        s_pp_I.abs() * s_pp_J.abs()
+                                    )
+                                else:
+                                    pp_proxy[p_idx] = (s_pp_I.abs() + s_pp_J.abs()) / 2
                             # else: leave as 1.0
 
                     new_pp_vals[sample_idx, :] = pp_proxy

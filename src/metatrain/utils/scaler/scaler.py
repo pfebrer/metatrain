@@ -32,7 +32,10 @@ class Scaler(torch.nn.Module):
     :param per_property_for_atom_pair_targets: Whether to fit per-property scales for
         atom-pair targets.
     :param use_onsite_scales_for_offsite: Whether to replace edge target scales with a
-        geometric-mean proxy derived from the corresponding node target scales.
+        proxy derived from the corresponding node target scales.
+    :param offsite_proxy_mean: Aggregation used for the onsite proxy. Either
+        ``"geometric"`` (``sqrt(s_I * s_J)``) or ``"arithmetic"``
+        (``(s_I + s_J) / 2``). Only used when ``use_onsite_scales_for_offsite=True``.
     """
 
     # Needed for torchscript compatibility
@@ -44,6 +47,7 @@ class Scaler(torch.nn.Module):
         dataset_info: DatasetInfo,
         per_property_for_atom_pair_targets: bool = True,
         use_onsite_scales_for_offsite: bool = False,
+        offsite_proxy_mean: str = "geometric",
     ):
         super().__init__()
 
@@ -55,6 +59,7 @@ class Scaler(torch.nn.Module):
             )
 
         self.use_onsite_scales_for_offsite = use_onsite_scales_for_offsite
+        self.offsite_proxy_mean = offsite_proxy_mean
 
         self.dataset_info = dataset_info
         self.atomic_types = sorted(dataset_info.atomic_types)
@@ -417,8 +422,13 @@ class Scaler(torch.nn.Module):
             node_name = edge_name.replace("::matrix_edges::", "::matrix_nodes::")
             if node_name not in self.model.target_names:
                 continue
-            logging.info(f"Applying onsite-scale proxy: '{node_name}' → '{edge_name}'")
-            self.model.apply_onsite_scales_for_offsite(node_name, edge_name)
+            logging.info(
+                f"Applying onsite-scale proxy ({self.offsite_proxy_mean} mean): "
+                f"'{node_name}' → '{edge_name}'"
+            )
+            self.model.apply_onsite_scales_for_offsite(
+                node_name, edge_name, mean=self.offsite_proxy_mean
+            )
 
     def restart(self, dataset_info: DatasetInfo) -> "Scaler":
         """
