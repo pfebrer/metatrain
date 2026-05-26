@@ -34,6 +34,17 @@ from metatrain.utils.sum_over_atoms import sum_over_atoms
 
 from . import checkpoints
 from .documentation import ModelHypers
+from .modules.atomic_basis import (
+    IrrepResidualFiLM,
+    IrrepResidualReadout,
+    IrrepResidualZCorrection,
+    IrrepResidualZCorrectionDeep,
+    IrrepResidualZOutput,
+    IrrepThenMoE,
+    IrrepThenZConditioned,
+    MoEReadout,
+    ZConditionedReadout,
+)
 from .modules.finetuning import apply_finetuning_strategy
 from .modules.structures import systems_to_batch
 from .modules.transformer import CartesianTransformer
@@ -90,6 +101,7 @@ class PET(ModelInterface[ModelHypers]):
         self.cutoff_cm_scaler = self.hypers["cutoff_cm_scaler"]
         self.transformer_type = self.hypers["transformer_type"]
         self.featurizer_type = self.hypers["featurizer_type"]
+        self.readout_type = self.hypers["readout_type"]
 
         self.atomic_types = dataset_info.atomic_types
         self.requested_nl = NeighborListOptions(
@@ -580,6 +592,8 @@ class PET(ModelInterface[ModelHypers]):
                     outputs,
                     centers,
                     nef_to_edges_neighbor,
+                    element_indices_nodes,
+                    element_indices_neighbors,
                 )
             )
             atomic_predictions_dict = self._get_output_atomic_predictions(
@@ -1063,6 +1077,8 @@ class PET(ModelInterface[ModelHypers]):
         outputs: Dict[str, ModelOutput],
         centers: torch.Tensor,
         nef_to_edges_neighbor: torch.Tensor,
+        element_indices_nodes: torch.Tensor,
+        element_indices_neighbors: torch.Tensor,
     ) -> Tuple[
         Dict[str, List[List[torch.Tensor]]], Dict[str, List[List[torch.Tensor]]]
     ]:
@@ -1084,6 +1100,9 @@ class PET(ModelInterface[ModelHypers]):
             [n_atoms, max_num_neighbors].
         :param nef_to_edges_neighbor: Tensor mapping node-edge-feature indices to
             neighbor atom indices [n_atoms, max_num_neighbors].
+        :param element_indices_nodes: Species index for each center atom [n_atoms].
+        :param element_indices_neighbors: Species index for each neighbor in NEF
+            layout [n_atoms, max_num_neighbors].
         :return: Tuple of two dictionaries:
             - Dictionary mapping output names to lists of lists of node atomic
               prediction tensors (one list per GNN layer, one tensor per block)
@@ -1109,7 +1128,9 @@ class PET(ModelInterface[ModelHypers]):
                     node_atomic_predictions_by_block: List[torch.Tensor] = []
                     for node_last_layer_by_block in node_last_layer.values():
                         node_atomic_predictions_by_block.append(
-                            node_last_layer_by_block(node_last_layer_features)
+                            node_last_layer_by_block(
+                                node_last_layer_features, element_indices_nodes
+                            )
                         )
                     node_atomic_predictions_dict[output_name].append(
                         node_atomic_predictions_by_block
@@ -1129,17 +1150,43 @@ class PET(ModelInterface[ModelHypers]):
                         output_name
                     ][i]
                     edge_atomic_predictions_by_block: List[torch.Tensor] = []
+                    is_pair_target = (
+                        self.outputs[output_name].sample_kind == "atom_pair"
+                    )
                     for edge_last_layer_by_block in edge_last_layer.values():
-                        edge_atomic_predictions = edge_last_layer_by_block(
-                            edge_last_layer_features
-                        )
+                        if is_pair_target:
+                            # Pair conditioning: flatten NEF features and index
+                            # by the flat pair index Z_I * n_species + Z_J so
+                            # each (center, neighbor) pair gets its own readout.
+                            n_atoms = edge_last_layer_features.shape[0]
+                            max_nb = edge_last_layer_features.shape[1]
+                            n_species = len(self.atomic_types)
+                            pair_idx_2d = (
+                                element_indices_nodes[:, None] * n_species
+                                + element_indices_neighbors
+                            )  # (n_atoms, max_nb)
+                            features_flat = edge_last_layer_features.view(
+                                n_atoms * max_nb,
+                                edge_last_layer_features.shape[2],
+                            )
+                            pair_idx_flat = pair_idx_2d.view(-1)
+                            out_flat = edge_last_layer_by_block(
+                                features_flat, pair_idx_flat
+                            )
+                            edge_atomic_predictions = out_flat.view(
+                                n_atoms, max_nb, -1
+                            )
+                        else:
+                            edge_atomic_predictions = edge_last_layer_by_block(
+                                edge_last_layer_features, element_indices_nodes
+                            )
                         expanded_padding_mask = padding_mask[..., None].repeat(
                             1, 1, edge_atomic_predictions.shape[2]
                         )
                         edge_atomic_predictions = torch.where(
                             ~expanded_padding_mask, 0.0, edge_atomic_predictions
                         )
-                        if self.outputs[output_name].sample_kind == "atom_pair":
+                        if is_pair_target:
                             edge_atomic_predictions_by_block.append(
                                 edge_atomic_predictions[centers, nef_to_edges_neighbor]
                             )
@@ -1364,6 +1411,129 @@ class PET(ModelInterface[ModelHypers]):
         """
         return densify_atomic_basis_dataset_info(dataset_info)
 
+    def _make_readout(
+        self,
+        in_features: int,
+        out_features: int,
+        is_atomic_basis: bool,
+        is_edge_target: bool = False,
+    ) -> torch.nn.Module:
+        """
+        Factory: return the readout module for one output block.
+
+        For non-atomic-basis targets (or when ``readout_type`` is ``None``),
+        returns a plain shared linear layer (``ZConditionedReadout`` with
+        ``z_conditioned=False``).
+
+        For atomic basis targets with ``readout_type`` set, dispatches on
+        ``readout_type["name"]`` to construct the appropriate module.
+
+        For edge (atom-pair) targets, ``n_species²`` weight matrices are used
+        so that the readout can be indexed by the flat pair index
+        ``Z_I * n_species + Z_J`` at inference time.
+
+        :param in_features: Input feature dimension.
+        :param out_features: Output feature dimension for this block.
+        :param is_atomic_basis: Whether this target is an atomic basis target.
+        :param is_edge_target: Whether this is an edge (atom-pair) target.
+            When ``True`` and the target is an atomic basis target with a
+            Z-conditioned ``readout_type``, uses ``n_species²`` weight
+            matrices for full center/neighbor pair conditioning.
+        :return: A ``torch.nn.Module`` with forward signature
+            ``(features, species_idx) -> predictions``.
+        """
+        n_species = len(self.atomic_types)
+        # For edge targets, pair-index the readout over n_species² pairs.
+        n_readout_species = n_species * n_species if is_edge_target else n_species
+
+        if not is_atomic_basis or self.readout_type is None:
+            # Vanilla shared linear — same for all species, no Z-conditioning.
+            return ZConditionedReadout(
+                in_features, out_features, n_readout_species, z_conditioned=False
+            )
+
+        name = self.readout_type.get("name", "ZConditioned")
+        args = self.readout_type.get("args", {})
+
+        if name == "ZConditioned":
+            return ZConditionedReadout(
+                in_features,
+                out_features,
+                n_readout_species,
+                z_conditioned=True,
+                hidden_layer_widths=args.get("hidden_layer_widths", None),
+            )
+
+        elif name == "MoE":
+            return MoEReadout(
+                in_features,
+                out_features,
+                n_readout_species,
+                num_experts=args["num_experts"],
+                num_routed_experts=args["num_routed_experts"],
+                num_topk_experts=args["num_topk_experts"],
+                embedding_dim=args.get("embedding_dim", 16),
+            )
+
+        elif name == "IrrepThenZConditioned":
+            return IrrepThenZConditioned(
+                in_features,
+                out_features,
+                n_readout_species,
+                z_conditioned=args.get("z_conditioned", True),
+                hidden_layer_widths=args.get("hidden_layer_widths", None),
+            )
+
+        elif name == "IrrepThenMoE":
+            return IrrepThenMoE(
+                in_features,
+                out_features,
+                n_readout_species,
+                d_irrep=args.get("d_irrep", in_features),
+                num_experts=args["num_experts"],
+                num_routed_experts=args["num_routed_experts"],
+                num_topk_experts=args["num_topk_experts"],
+                embedding_dim=args.get("embedding_dim", 16),
+            )
+
+        elif name == "IrrepResidual":
+            return IrrepResidualReadout(
+                in_features,
+                out_features,
+                n_readout_species,
+                z_conditioned=args.get("z_conditioned", True),
+            )
+
+        elif name == "IrrepResidualZOutput":
+            return IrrepResidualZOutput(in_features, out_features, n_readout_species)
+
+        elif name == "IrrepResidualFiLM":
+            return IrrepResidualFiLM(in_features, out_features, n_readout_species)
+
+        elif name == "IrrepResidualZCorrection":
+            return IrrepResidualZCorrection(
+                in_features,
+                out_features,
+                n_readout_species,
+                args.get("expansion_factor"),
+            )
+
+        elif name == "IrrepResidualZCorrectionDeep":
+            return IrrepResidualZCorrectionDeep(
+                in_features,
+                out_features,
+                n_readout_species,
+                num_correction_layers=args.get("num_correction_layers", 2),
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown readout_type name: '{name}'. "
+                "Available: ZConditioned, MoE, IrrepThenZConditioned, IrrepThenMoE, "
+                "IrrepResidual, IrrepResidualZOutput, IrrepResidualFiLM, "
+                "IrrepResidualZCorrection, IrrepResidualZCorrectionDeep."
+            )
+
     def _add_output(self, target_name: str, target_info: TargetInfo) -> None:
         """
         Register a new output target by creating corresponding heads and last layers.
@@ -1388,6 +1558,9 @@ class PET(ModelInterface[ModelHypers]):
             sample_kind=target_info.sample_kind,
             description=target_info.description,
         )
+
+        is_atomic_basis = target_name in self.target_sparse_properties
+        is_edge_target = target_info.sample_kind == "atom_pair"
 
         self.node_heads[target_name] = torch.nn.ModuleList(
             [
@@ -1417,10 +1590,11 @@ class PET(ModelInterface[ModelHypers]):
             [
                 torch.nn.ModuleDict(
                     {
-                        key: torch.nn.Linear(
+                        key: self._make_readout(
                             self.d_head,
                             prod(shape),
-                            bias=True,
+                            is_atomic_basis,
+                            is_edge_target=False,
                         )
                         for key, shape in self.output_shapes[target_name].items()
                     }
@@ -1433,10 +1607,11 @@ class PET(ModelInterface[ModelHypers]):
             [
                 torch.nn.ModuleDict(
                     {
-                        key: torch.nn.Linear(
+                        key: self._make_readout(
                             self.d_head,
                             prod(shape),
-                            bias=True,
+                            is_atomic_basis,
+                            is_edge_target=is_edge_target,
                         )
                         for key, shape in self.output_shapes[target_name].items()
                     }

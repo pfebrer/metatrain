@@ -66,7 +66,7 @@ important** (in decreasing order of importance):
       :no-index:
 """
 
-from typing import Literal, Optional
+from typing import Any, Dict, Literal, Optional
 
 from typing_extensions import TypedDict
 
@@ -172,6 +172,80 @@ class ModelHypers(TypedDict):
     """Use ZBL potential for short-range repulsion"""
     long_range: LongRangeHypers = init_with_defaults(LongRangeHypers)
     """Long-range Coulomb interactions parameters."""
+    readout_type: Optional[Dict[str, Any]] = None
+    """Readout module used for atomic basis targets.
+
+    ``null`` (default): a single shared linear layer per irrep block, no
+    species conditioning.  This is the vanilla PET readout.
+
+    Otherwise a dict with ``name`` and optional ``args``:
+
+    .. code-block:: yaml
+
+        # ── Z-conditioned linear (or MLP) per (irrep, species) ──────────────
+        readout_type:
+          name: ZConditioned
+          args:
+            hidden_layer_widths: [64]   # omit or [] for plain linear
+
+        # ── Mixture-of-Experts, routing conditioned on Z ────────────────────
+        readout_type:
+          name: MoE
+          args:
+            num_experts: 5
+            num_routed_experts: 5
+            num_topk_experts: 2
+            embedding_dim: 16           # optional, default 16
+
+        # ── Per-irrep MLP → Z-conditioned linear/MLP ────────────────────────
+        readout_type:
+          name: IrrepThenZConditioned
+          args:
+            z_conditioned: true
+            hidden_layer_widths: []
+
+        # ── Per-irrep MLP → MoE ──────────────────────────────────────────────
+        readout_type:
+          name: IrrepThenMoE
+          args:
+            d_irrep: 64
+            num_experts: 5
+            num_routed_experts: 5
+            num_topk_experts: 2
+
+        # ── Trunk + per-irrep residual correction, gated by species ─────────
+        readout_type:
+          name: IrrepResidual
+          args:
+            z_conditioned: true
+
+        # ── Trunk + shared hidden → Z-conditioned output (zero-init) ────────
+        readout_type:
+          name: IrrepResidualZOutput
+
+        # ── Trunk + FiLM-conditioned correction (zero-init output) ───────────
+        readout_type:
+          name: IrrepResidualFiLM
+
+        # ── Trunk + fully Z-conditioned correction MLP (zero-init output) ────
+        readout_type:
+          name: IrrepResidualZCorrection
+          args:
+            expansion_factor: 1
+
+        # ── Trunk + deep Z-conditioned correction tower (zero-init output) ───
+        readout_type:
+          name: IrrepResidualZCorrectionDeep
+          args:
+            num_correction_layers: 2
+
+    For edge (atom-pair) targets the readout uses ``n_species²`` weight
+    matrices indexed by the flat pair index ``Z_I * n_species + Z_J``,
+    giving full center/neighbor pair conditioning.
+
+    Applies only to atomic basis targets; non-atomic-basis targets always
+    use a shared linear readout regardless of this setting.
+    """
     use_onsite_scales_for_offsite: bool = False
     """Use onsite (node) scales as a proxy for offsite scales.
 
