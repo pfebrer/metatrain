@@ -309,6 +309,231 @@ class TensorMapMSELoss(BaseTensorMapLoss):
         )
 
 
+class TensorMapSignInvariantMSELoss(BaseTensorMapLoss):
+    """
+    Mean-squared error on TensorMap entries, invariant to a global target sign.
+
+    This computes ``min(MSE(pred, target), MSE(pred, -target))``. When
+    ``companion_targets`` are provided, the sign choice is made jointly over this
+    target and all companions. This is useful for targets with a global phase
+    ambiguity, such as transition density matrices.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode for the returned loss. Only ``"mean"`` and
+        ``"sum"`` are supported for sign-invariant MSE.
+    :param companion_targets: additional target keys sharing the same sign choice.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+        companion_targets: Optional[list[str]] = None,
+    ):
+        super().__init__(
+            name,
+            gradient,
+            weight,
+            reduction,
+            loss_fn=torch.nn.MSELoss(reduction="none"),
+        )
+        self.companion_targets = companion_targets or []
+
+    def _flatten_target_pair(
+        self, predictions: Dict[str, TensorMap], targets: Dict[str, TensorMap]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pred_values = []
+        target_values = []
+
+        for target_name in [self.target, *self.companion_targets]:
+            if target_name not in predictions:
+                continue
+            pred_tmap = predictions[target_name]
+            target_tmap = targets[target_name]
+
+            for key in pred_tmap.keys:
+                pred_block = pred_tmap.block(key)
+                target_block = target_tmap.block(key)
+                if self.gradient is None:
+                    pred = pred_block.values.reshape(-1)
+                    target = target_block.values.reshape(-1)
+                else:
+                    pred = pred_block.gradient(self.gradient).values.reshape(-1)
+                    target = target_block.gradient(self.gradient).values.reshape(-1)
+
+                valid = ~torch.isnan(target)
+                pred_values.append(pred[valid])
+                target_values.append(target[valid])
+
+        if not pred_values:
+            first_tmap = next(iter(predictions.values()))
+            first_block = first_tmap.block(first_tmap.keys[0])
+            empty = torch.empty(
+                0, dtype=first_block.values.dtype, device=first_block.values.device
+            )
+            return empty, empty
+
+        return torch.cat(pred_values), torch.cat(target_values)
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        pred, target = self._flatten_target_pair(predictions, targets)
+        if len(target) == 0:
+            first_tensor_map = next(iter(predictions.values()))
+            first_block = first_tensor_map.block(first_tensor_map.keys[0])
+            return torch.zeros(
+                (), dtype=first_block.values.dtype, device=first_block.values.device
+            )
+
+        loss_plus = self.torch_loss(pred, target)
+        loss_minus = self.torch_loss(pred, -target)
+
+        if self.reduction == "sum":
+            loss_plus = loss_plus.sum()
+            loss_minus = loss_minus.sum()
+        else:
+            loss_plus = loss_plus.mean()
+            loss_minus = loss_minus.mean()
+
+        sign = torch.sign(loss_minus - loss_plus)
+        # Modify targets inplace to make sure that the MAE logging
+        # later will be computed correctly
+        for target_name in [self.target, *self.companion_targets]:
+            if target_name not in predictions:
+                continue
+            target_tmap = targets[target_name]
+            for key in target_tmap.keys:
+                target_block = target_tmap.block(key)
+                target_block.values[:] = target_block.values * sign
+
+        return torch.minimum(loss_plus, loss_minus)
+
+
+class SkipLoss(LossInterface):
+    """Zero-valued loss term used when another configured loss covers this target."""
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        first_tensor_map = next(iter(predictions.values()))
+        first_block = first_tensor_map.block(first_tensor_map.keys[0])
+        return torch.zeros(
+            (), dtype=first_block.values.dtype, device=first_block.values.device
+        )
+
+
+class TensorMapMAELoss(BaseTensorMapLoss):
+    """
+    Unmasked mean-absolute error on :py:class:`TensorMap` entries.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode for torch loss.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        super().__init__(
+            name,
+            gradient,
+            weight,
+            reduction,
+            loss_fn=torch.nn.L1Loss(reduction=reduction),
+        )
+
+class SquareAndMSE(torch.nn.Module):
+    """
+    Custom loss that computes the square of the MSE between predictions and targets.
+    """
+
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        self.mse = torch.nn.MSELoss(reduction=reduction)
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        mse_loss = self.mse(input ** 2, target **2)
+        return mse_loss
+    
+class TensorMapSquareAndMSELoss(BaseTensorMapLoss):
+    """
+    Unmasked square of mean-squared error on :py:class:`TensorMap` entries.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode for torch loss.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        super().__init__(
+            name,
+            gradient,
+            weight,
+            reduction,
+            loss_fn=SquareAndMSE(reduction=reduction),
+        )
+
+class SquareAndMAE(torch.nn.Module):
+    """
+    Custom loss that computes the square of the MAE between predictions and targets.
+    """
+
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        self.mae = torch.nn.L1Loss(reduction=reduction)
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        mae_loss = self.mae(input**2, target**2)
+        return mae_loss
+    
+class TensorMapSquareAndMAELoss(BaseTensorMapLoss):
+    """
+    Unmasked square of mean-squared error on :py:class:`TensorMap` entries.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode for torch loss.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        super().__init__(
+            name,
+            gradient,
+            weight,
+            reduction,
+            loss_fn=SquareAndMAE(reduction=reduction),
+        )
+    
 class TensorMapMAELoss(BaseTensorMapLoss):
     """
     Unmasked mean-absolute error on :py:class:`TensorMap` entries.
@@ -1173,6 +1398,7 @@ class LossType(Enum):
     """
 
     MSE = ("mse", TensorMapMSELoss)
+    SIGN_INVARIANT_MSE = ("sign_invariant_mse", TensorMapSignInvariantMSELoss)
     MAE = ("mae", TensorMapMAELoss)
     HUBER = ("huber", TensorMapHuberLoss)
     MASKED_MSE = ("masked_mse", TensorMapMaskedMSELoss)
@@ -1184,6 +1410,9 @@ class LossType(Enum):
     GAUSSIAN_NLL = ("gaussian_nll_ensemble", TensorMapGaussianNLLLoss)
     GAUSSIAN_CRPS = ("gaussian_crps_ensemble", TensorMapGaussianCRPSLoss)
     EMPIRICAL_CRPS = ("empirical_crps_ensemble", TensorMapEmpiricalCRPSLoss)
+    SKIP = ("skip", SkipLoss)
+    SQUAREANDMSE = ("squareandmse", TensorMapSquareAndMSELoss)
+    SQUAREANDMAE = ("squareandmae", TensorMapSquareAndMAELoss)
 
     def __init__(self, key: str, cls: Type[LossInterface]) -> None:
         self._key = key

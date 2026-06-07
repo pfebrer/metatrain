@@ -248,7 +248,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             target_keys=list(train_targets.keys()),
             callables=[
                 atomic_basis_transform,
-                rotational_augmenter.apply_random_augmentations,
+                #rotational_augmenter.apply_random_augmentations,
                 get_system_with_neighbor_lists_transform(requested_neighbor_lists),
                 get_remove_additive_transform(additive_models, train_targets),
                 get_remove_scale_transform(scaler),
@@ -321,8 +321,8 @@ class Trainer(TrainerInterface[TrainerHypers]):
                         dataset=train_dataset,
                         batch_size=self.hypers["batch_size"],
                         sampler=train_sampler,
-                        shuffle=(train_sampler is None),
-                        drop_last=(train_sampler is None),
+                        shuffle=False, #(train_sampler is None),
+                        drop_last=False, #(train_sampler is None),
                         collate_fn=collate_fn_train,
                         num_workers=num_workers,
                     )
