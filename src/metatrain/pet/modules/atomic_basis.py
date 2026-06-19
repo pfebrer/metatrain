@@ -246,7 +246,8 @@ class MoEReadout(torch.nn.Module):
         if num_topk_experts < 1 or num_topk_experts > num_routed_experts:
             raise ValueError(
                 f"num_topk_experts = {num_topk_experts}; "
-                f"must satisfy 1 ≤ num_topk_experts ≤ num_routed_experts ({num_routed_experts})."
+                f"must satisfy 1 ≤ num_topk_experts ≤ num_routed_experts "
+                f"({num_routed_experts})."
             )
 
         self.num_topk = num_topk_experts
@@ -447,7 +448,8 @@ class IrrepResidualZOutput(torch.nn.Module):
 
     .. math::
         \\text{output} = \\underbrace{W_z \\, h_i}_{\\text{trunk}}
-                       + \\underbrace{(W_z^{\\prime} \\, \\text{SiLU}(U \\, h_i))}_{\\text{correction}}
+                       + \\underbrace{(W_z^{\\prime} \\,
+                       \\text{SiLU}(U \\, h_i))}_{\\text{correction}}
 
     where :math:`U` is a *shared* hidden-layer weight (species-agnostic) and
     :math:`W_z^{\\prime}` is a *per-species* output-layer weight (zero-initialized).
@@ -520,7 +522,8 @@ class IrrepResidualFiLM(torch.nn.Module):
     .. math::
         x_z       &= \\gamma_z \\odot h_i + \\beta_z  \\quad\\text{(FiLM)}\\\\
         \\text{output} &= W_z h_i
-                        + \\underbrace{U_\\text{out} \\, \\text{SiLU}(U_\\text{hid}\\, x_z)}_{\\text{correction}}
+                        + \\underbrace{U_\\text{out} \\,
+                        \\text{SiLU}(U_\\text{hid}\\, x_z)}_{\\text{correction}}
 
     where :math:`\\gamma_z` and :math:`\\beta_z` are per-species vectors of size
     ``in_features``, initialized to ones and zeros respectively (identity
@@ -598,7 +601,8 @@ class IrrepResidualZCorrection(torch.nn.Module):
 
     .. math::
         \\text{output} = \\underbrace{W_z \\, h_i}_{\\text{trunk}}
-                       + \\underbrace{W_z^{\\prime} \\, \\text{SiLU}(V_z \\, h_i)}_{\\text{correction}}
+                       + \\underbrace{W_z^{\\prime} \\,
+                       \\text{SiLU}(V_z \\, h_i)}_{\\text{correction}}
 
     where :math:`V_z` and :math:`W_z^{\\prime}` are both Z-conditioned.
     Only :math:`W_z^{\\prime}` (the output layer) is zero-initialized; the
@@ -619,6 +623,7 @@ class IrrepResidualZCorrection(torch.nn.Module):
     :param in_features: Input feature dimension.
     :param out_features: Output dimension for this block.
     :param n_species: Number of distinct atomic species.
+    :param expansion_factor: Multiplier for the hidden dimension of the correction
     """
 
     def __init__(
@@ -826,6 +831,75 @@ class IrrepThenZConditioned(torch.nn.Module):
             n_species,
             z_conditioned=z_conditioned,
             hidden_layer_widths=hidden_layer_widths,
+        )
+
+    def forward(
+        self, features: torch.Tensor, species_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        :param features: ``(n_atoms, in_features)`` or
+            ``(n_atoms, n_neighbours, in_features)``.
+        :param species_idx: Long tensor ``(n_atoms,)``.
+        :return: Same leading dims as ``features``, last dim ``out_features``.
+        """
+        return self.readout(self.irrep_mlp(features), species_idx)
+
+
+class IrrepThenZConditioned2(torch.nn.Module):
+    """
+    Per-irrep shared MLP followed by a Z-conditioned (or shared) linear readout.
+
+    Maps last-layer features through two sequential stages:
+
+    1. **Irrep MLP** ``d → d'(α)`` — a single SiLU-activated linear layer whose
+       weights are *shared across species* but *unique per irrep block*.  This
+       extracts features that are specifically useful for angular channel α,
+       independently of which atomic species is at the centre.
+
+    2. **Z-conditioned readout** ``d'(α) → q(α, Z)`` — a linear
+       :class:`ZConditionedReadout` that separates species-specific behaviour from the
+       irrep-specific features.
+
+    The separation of roles mirrors the factorisation
+
+    .. math::
+        q(\\alpha, Z) = f_Z\\!\\left(g_\\alpha(h_i)\\right)
+
+    where :math:`g_\\alpha` is species-agnostic (learns *what* is informative
+    for irrep :math:`\\alpha`) and :math:`f_Z` is irrep-agnostic (learns *how*
+    species :math:`Z` modulates those features).
+
+    :param in_features: Input feature dimension ``d`` (``d_head``).
+    :param hidden_features: Hidden dimension for the per-irrep MLP.
+    :param out_features: Total output dimension for this block.
+    :param n_species: Number of distinct atomic species.
+    :param z_conditioned: Whether the final readout uses per-species weights.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        out_features: int,
+        n_species: int,
+        z_conditioned: bool = True,
+    ) -> None:
+        super().__init__()
+
+        # Stage 1: per-irrep shared feature extraction
+        self.irrep_mlp = torch.nn.Sequential(
+            torch.nn.Linear(in_features, hidden_features),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_features, hidden_features),
+            torch.nn.SiLU(),
+        )
+
+        # Stage 2: Z-conditioned (or shared) linear/MLP readout
+        self.readout = ZConditionedReadout(
+            hidden_features,
+            out_features,
+            n_species,
+            z_conditioned=z_conditioned,
         )
 
     def forward(

@@ -42,6 +42,7 @@ from .modules.atomic_basis import (
     IrrepResidualZOutput,
     IrrepThenMoE,
     IrrepThenZConditioned,
+    IrrepThenZConditioned2,
     MoEReadout,
     ZConditionedReadout,
 )
@@ -102,6 +103,7 @@ class PET(ModelInterface[ModelHypers]):
         self.transformer_type = self.hypers["transformer_type"]
         self.featurizer_type = self.hypers["featurizer_type"]
         self.readout_type = self.hypers["readout_type"]
+        self.num_head_layers = self.hypers["num_head_layers"]
 
         self.atomic_types = dataset_info.atomic_types
         self.requested_nl = NeighborListOptions(
@@ -167,9 +169,14 @@ class PET(ModelInterface[ModelHypers]):
         self.edge_heads = torch.nn.ModuleDict()
         self.node_last_layers = torch.nn.ModuleDict()
         self.edge_last_layers = torch.nn.ModuleDict()
-        self.last_layer_feature_size = (
-            self.num_readout_layers * self.d_head * self.NUM_FEATURE_TYPES
-        )  # for LLPR
+        if self.num_head_layers == 0:
+            self.last_layer_feature_size = self.num_readout_layers * (
+                self.d_node + self.d_pet
+            )
+        else:
+            self.last_layer_feature_size = (
+                self.num_readout_layers * self.d_head * self.NUM_FEATURE_TYPES
+            )  # for LLPR
 
         # the model is always capable of outputting the internal features
         self.outputs = {
@@ -1173,9 +1180,7 @@ class PET(ModelInterface[ModelHypers]):
                             out_flat = edge_last_layer_by_block(
                                 features_flat, pair_idx_flat
                             )
-                            edge_atomic_predictions = out_flat.view(
-                                n_atoms, max_nb, -1
-                            )
+                            edge_atomic_predictions = out_flat.view(n_atoms, max_nb, -1)
                         else:
                             edge_atomic_predictions = edge_last_layer_by_block(
                                 edge_last_layer_features, element_indices_nodes
@@ -1411,6 +1416,22 @@ class PET(ModelInterface[ModelHypers]):
         """
         return densify_atomic_basis_dataset_info(dataset_info)
 
+    def _make_head(self, d_in: int) -> torch.nn.Module:
+        """Build a head MLP with ``num_head_layers`` linear+SiLU layers.
+
+        Returns ``torch.nn.Identity()`` when ``num_head_layers == 0``.
+
+        :param d_in: Input feature dimension for the head.
+        :return: A ``torch.nn.Module`` that applies the head transformation.
+        """
+        n = self.num_head_layers
+        if n == 0:
+            return torch.nn.Identity()
+        layers: list = [torch.nn.Linear(d_in, self.d_head), torch.nn.SiLU()]
+        for _ in range(n - 1):
+            layers.extend([torch.nn.Linear(self.d_head, self.d_head), torch.nn.SiLU()])
+        return torch.nn.Sequential(*layers)
+
     def _make_readout(
         self,
         in_features: int,
@@ -1484,6 +1505,19 @@ class PET(ModelInterface[ModelHypers]):
                 hidden_layer_widths=args.get("hidden_layer_widths", None),
             )
 
+        elif name == "IrrepThenZConditioned2":
+            if is_edge_target:
+                hidden_features = args.get("d_irrep_head_edge", in_features * 4)
+            else:
+                hidden_features = args.get("d_irrep_head_node", in_features * 2)
+            return IrrepThenZConditioned2(
+                in_features,
+                hidden_features,
+                out_features,
+                n_readout_species,
+                z_conditioned=args.get("z_conditioned", True),
+            )
+
         elif name == "IrrepThenMoE":
             return IrrepThenMoE(
                 in_features,
@@ -1529,7 +1563,8 @@ class PET(ModelInterface[ModelHypers]):
         else:
             raise ValueError(
                 f"Unknown readout_type name: '{name}'. "
-                "Available: ZConditioned, MoE, IrrepThenZConditioned, IrrepThenMoE, "
+                "Available: ZConditioned, MoE, IrrepThenZConditioned, "
+                "IrrepThenZConditioned2, IrrepThenMoE, "
                 "IrrepResidual, IrrepResidualZOutput, IrrepResidualFiLM, "
                 "IrrepResidualZCorrection, IrrepResidualZCorrectionDeep."
             )
@@ -1563,35 +1598,22 @@ class PET(ModelInterface[ModelHypers]):
         is_edge_target = target_info.sample_kind == "atom_pair"
 
         self.node_heads[target_name] = torch.nn.ModuleList(
-            [
-                torch.nn.Sequential(
-                    torch.nn.Linear(self.d_node, self.d_head),
-                    torch.nn.SiLU(),
-                    torch.nn.Linear(self.d_head, self.d_head),
-                    torch.nn.SiLU(),
-                )
-                for _ in range(self.num_readout_layers)
-            ]
+            [self._make_head(self.d_node) for _ in range(self.num_readout_layers)]
         )
 
         self.edge_heads[target_name] = torch.nn.ModuleList(
-            [
-                torch.nn.Sequential(
-                    torch.nn.Linear(self.d_pet, self.d_head),
-                    torch.nn.SiLU(),
-                    torch.nn.Linear(self.d_head, self.d_head),
-                    torch.nn.SiLU(),
-                )
-                for _ in range(self.num_readout_layers)
-            ]
+            [self._make_head(self.d_pet) for _ in range(self.num_readout_layers)]
         )
+
+        node_readout_in = self.d_node if self.num_head_layers == 0 else self.d_head
+        edge_readout_in = self.d_pet if self.num_head_layers == 0 else self.d_head
 
         self.node_last_layers[target_name] = torch.nn.ModuleList(
             [
                 torch.nn.ModuleDict(
                     {
                         key: self._make_readout(
-                            self.d_head,
+                            node_readout_in,
                             prod(shape),
                             is_atomic_basis,
                             is_edge_target=False,
@@ -1608,7 +1630,7 @@ class PET(ModelInterface[ModelHypers]):
                 torch.nn.ModuleDict(
                     {
                         key: self._make_readout(
-                            self.d_head,
+                            edge_readout_in,
                             prod(shape),
                             is_atomic_basis,
                             is_edge_target=is_edge_target,

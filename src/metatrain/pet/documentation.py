@@ -239,12 +239,32 @@ class ModelHypers(TypedDict):
           args:
             num_correction_layers: 2
 
+        # ── 2-layer shared MLP → Z-conditioned linear ───────────────────────
+        # Stage 1: shared 2-layer MLP in→hidden→hidden (SiLU activations).
+        # Stage 2: linear Z-conditioned readout hidden→out.
+        # ``d_irrep_head_node`` / ``d_irrep_head_edge`` set the hidden width
+        # for node and edge targets independently (defaults: 2× / 4× d_head).
+        readout_type:
+          name: IrrepThenZConditioned2
+          args:
+            d_irrep_head_node: 256   # optional; default 2 * node_readout_in
+            d_irrep_head_edge: 512   # optional; default 4 * edge_readout_in
+            z_conditioned: true      # optional, default true
+
     For edge (atom-pair) targets the readout uses ``n_species²`` weight
     matrices indexed by the flat pair index ``Z_I * n_species + Z_J``,
     giving full center/neighbor pair conditioning.
 
     Applies only to atomic basis targets; non-atomic-basis targets always
     use a shared linear readout regardless of this setting.
+    """
+    num_head_layers: int = 2
+    """Number of linear+SiLU layers in the per-target node/edge heads.
+
+    Each head maps ``d_node`` → ``d_head`` (nodes) or ``d_pet`` → ``d_head``
+    (edges) before the readout module.  When set to ``0`` the heads are
+    replaced by the identity and the readout receives the raw ``d_node`` /
+    ``d_pet`` features directly.
     """
     use_onsite_scales_for_offsite: bool = False
     """Use onsite (node) scales as a proxy for offsite scales.
