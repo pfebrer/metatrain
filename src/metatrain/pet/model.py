@@ -21,6 +21,7 @@ from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import ZBL
 from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atomic_basis_helpers import (
+    get_pair_sample_labels,
     densify_atomic_basis_dataset_info,
     sparsify_atomic_basis_target,
 )
@@ -41,7 +42,7 @@ from .modules.diagnostic import (
     prepare_diagnostic_handles,
     standardize_featurizer_input_tensor,
 )
-from .modules.structures import concatenate_structures, get_pair_sample_labels
+from .modules.structures import concatenate_structures
 
 
 AVAILABLE_FEATURIZERS = typing.get_args(ModelHypers.__annotations__["featurizer_type"])
