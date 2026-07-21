@@ -209,8 +209,6 @@ class MinMaxGap(torch.nn.Module):
             persistent=False,
         )
 
-        print(self._pooling_type, self.alphas)
-
     def requested_target_infos(self) -> dict[str, TargetInfo]:
         """
         Returns the list of requested target infos for the hook.
@@ -283,13 +281,13 @@ class MinMaxGap(torch.nn.Module):
                         names=["system"],
                         values=torch.arange(num_systems, dtype=torch.int32, device=device).reshape(-1, 1),
                     ),
-                    components=layout_block.components,
-                    properties=layout_block.properties,
+                    components=[c.to(device) for c in layout_block.components],
+                    properties=layout_block.properties.to(device),
                 )
             )
 
         output_tmap = TensorMap(
-            keys=self.out_target.layout.keys,
+            keys=self.out_target.layout.keys.to(device),
             blocks=blocks,
         )
             
