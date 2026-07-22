@@ -238,6 +238,7 @@ class MinMaxGap(torch.nn.Module):
         Computes the global multipole from the local predictions.
         """
         device = inputs[self._input_names[0]].block(0).values.device
+        layout = self.out_target.layout.to(device)
 
         num_systems = len(systems)
         system_indices = []
@@ -248,7 +249,7 @@ class MinMaxGap(torch.nn.Module):
         system_indices = torch.cat(system_indices, dim=0)
 
         blocks: list[TensorBlock]= []
-        for i, layout_block in enumerate(self.out_target.layout.blocks()):
+        for i, layout_block in enumerate(layout.blocks()):
 
             values_bottom = inputs[self._input_names[0]].block(i).values.ravel()
             values_top = inputs[self._input_names[1]].block(i).values.ravel()
@@ -281,13 +282,13 @@ class MinMaxGap(torch.nn.Module):
                         names=["system"],
                         values=torch.arange(num_systems, dtype=torch.int32, device=device).reshape(-1, 1),
                     ),
-                    components=[c.to(device) for c in layout_block.components],
-                    properties=layout_block.properties.to(device),
+                    components=layout.components,
+                    properties=layout.properties,
                 )
             )
 
         output_tmap = TensorMap(
-            keys=self.out_target.layout.keys.to(device),
+            keys=layout.keys,
             blocks=blocks,
         )
             
