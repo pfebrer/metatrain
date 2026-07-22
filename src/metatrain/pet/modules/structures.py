@@ -14,7 +14,6 @@ from .nef import (
 from .utilities import cutoff_func_bump, cutoff_func_cosine
 
 
-
 def concatenate_structures(
     systems: List[System],
     neighbor_list_options: NeighborListOptions,
