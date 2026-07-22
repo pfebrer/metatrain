@@ -131,7 +131,7 @@ def _make_layout_per_atom_pair():
                     names=["n"], values=torch.tensor([[0]], dtype=torch.int32)
                 ),
             ),
-            TensorBlock(  # l=0, CH: n=[4,5,6,7] - disjoint; ends up at positions 4-7 in union
+            TensorBlock(  # l=0, CH: n=[4,5,6,7] - disjoint; ends in union pos. 4-7
                 values=torch.empty((0, 1, 4), dtype=torch.float64),
                 samples=empty,
                 components=l0_comp,
@@ -140,7 +140,7 @@ def _make_layout_per_atom_pair():
                     values=torch.tensor([[1], [0], [2], [3]], dtype=torch.int32),
                 ),
             ),
-            TensorBlock(  # l=1, CH: n=[8,9] - disjoint; ends up at positions 8-9 in union
+            TensorBlock(  # l=1, CH: n=[8,9] - disjoint; ends in union pos. 8-9
                 values=torch.empty((0, 3, 2), dtype=torch.float64),
                 samples=empty,
                 components=l1_comp,

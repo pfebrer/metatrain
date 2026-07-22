@@ -509,7 +509,9 @@ class Scaler(torch.nn.Module):
             )
 
         elif layout.sample_names == valid_sample_names[2]:
-            index_pairs = list(itertools.product(range(len(self.atomic_types)), repeat=2))
+            index_pairs = list(
+                itertools.product(range(len(self.atomic_types)), repeat=2)
+            )
             samples = Labels(
                 ["first_atomic_type", "second_atomic_type"],
                 torch.tensor(index_pairs, dtype=torch.int32),

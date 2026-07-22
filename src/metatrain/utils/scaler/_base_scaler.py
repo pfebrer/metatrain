@@ -113,7 +113,9 @@ class BaseScaler(torch.nn.Module):
             # Atom-pair (edge) target. Scales are inferred from the onsite (node)
             # target, not computed from the atom pair targets.
             self.sample_kinds[target_name] = "atom_pair"
-            index_pairs = list(itertools.product(range(len(self.atomic_types)), repeat=2))
+            index_pairs = list(
+                itertools.product(range(len(self.atomic_types)), repeat=2)
+            )
             samples = Labels(
                 ["first_atomic_type", "second_atomic_type"],
                 torch.tensor(index_pairs, dtype=torch.int32),
@@ -744,7 +746,10 @@ class BaseScaler(torch.nn.Module):
 
                     n_types = len(self.atomic_types)
 
-                    if "first_atom_type" in key.names and "second_atom_type" in key.names:
+                    if (
+                        "first_atom_type" in key.names
+                        and "second_atom_type" in key.names
+                    ):
                         first_types = torch.full(
                             (len(output_block.samples),),
                             int(key["first_atom_type"]),
@@ -877,7 +882,7 @@ class BaseScaler(torch.nn.Module):
         """
         Computes the per-target scales of an atom-pair (edge) target from the per-target
         scales of the corresponding per-atom (node) target.
-        
+
         For each pair of atomic types (Z_I, Z_J), the per-target scale of the edge
         target is set to the geometric mean of the per-target scales of the node target
         for Z_I and Z_J.
@@ -896,9 +901,7 @@ class BaseScaler(torch.nn.Module):
         if edge_target_name not in self.target_names:
             raise ValueError(f"Edge target '{edge_target_name}' not found in scaler.")
         if self.sample_kinds[edge_target_name] != "atom_pair":
-            raise ValueError(
-                f"Target '{edge_target_name}' is not an atom-pair target."
-            )
+            raise ValueError(f"Target '{edge_target_name}' is not an atom-pair target.")
 
         node_pt = self.per_target_scales[node_target_name]
         edge_pt = self.per_target_scales[edge_target_name]
