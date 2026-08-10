@@ -1031,6 +1031,47 @@ class TensorMapEmpiricalCRPSLoss(TensorMapEnsembleLoss):
         y_target = target_values.reshape(-1)
 
         return self.torch_loss(y_ensemble, y_target)
+    
+class NegativeRankLoss(LossInterface):
+    """
+    Loss that computes the matrix rank of the predictions for a given lambda.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        super().__init__(name, gradient, weight, reduction)
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        """
+        Compute the unmasked pointwise loss.
+
+        :param predictions: mapping of names to :py:class:`TensorMap`.
+        :param targets: mapping of names to :py:class:`TensorMap`.
+        :param extra_data: ignored for unmasked losses.
+        :return: scalar torch.Tensor loss.
+        """
+        tensor_map_pred = predictions[self.target]
+        
+        loss = 0.0
+        for key, block in tensor_map_pred.items():
+            values = block.values
+            s = torch.linalg.svdvals(values)
+            #loss = loss -s[-1]
+            loss = loss + (((s / s[:, 0].reshape(-1, 1)) - 1)**2).mean() + ((s[:, 0] - 1)**2).mean()
+
+            print(key["o3_lambda"], abs(s).mean())#(abs(s) > 1e-6).sum(axis=1).to(torch.float32).mean(axis=0))
+
+        return loss
 
 
 # --- aggregator -----------------------------------------------------------------------
@@ -1051,6 +1092,13 @@ class LossAggregator(LossInterface):
         super().__init__(name="", gradient=None, weight=0.0, reduction="mean")
         self.losses: Dict[str, LossInterface] = {}
         self.metadata: Dict[str, Dict[str, Any]] = {}
+
+        self.losses["mtt::basis"] = NegativeRankLoss(
+            name="mtt::basis",
+            gradient=None,
+            weight=1.0,
+            reduction="mean",
+        )
 
         for target_name, target_info in targets.items():
             target_config = config.get(
@@ -1203,6 +1251,7 @@ class LossType(Enum):
     GAUSSIAN_NLL = ("gaussian_nll_ensemble", TensorMapGaussianNLLLoss)
     GAUSSIAN_CRPS = ("gaussian_crps_ensemble", TensorMapGaussianCRPSLoss)
     EMPIRICAL_CRPS = ("empirical_crps_ensemble", TensorMapEmpiricalCRPSLoss)
+    NEGATIVE_RANK = ("negative_rank", NegativeRankLoss)
 
     def __init__(self, key: str, cls: Type[LossInterface]) -> None:
         self._key = key
