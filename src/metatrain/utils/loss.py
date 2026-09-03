@@ -244,6 +244,100 @@ class BaseTensorMapLoss(LossInterface):
         return self.compute_flattened(tensor_map_pred, tensor_map_targ)
 
 
+class MatrixLoss(LossInterface):
+    """
+
+    Provides a compute_flattened() helper that extracts values or gradients,
+    flattens them, applies an optional mask, and computes the torch loss.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: dummy here; real weighting in ScheduledLoss.
+    :param reduction: reduction mode for torch loss.
+    :param loss_fn: pre-instantiated torch.nn loss (e.g. MSELoss).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        super().__init__(name, gradient, weight, reduction)
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        """
+        Compute the unmasked pointwise loss.
+
+        :param predictions: mapping of names to :py:class:`TensorMap`.
+        :param targets: mapping of names to :py:class:`TensorMap`.
+        :param extra_data: ignored for unmasked losses.
+        :return: scalar torch.Tensor loss.
+        """
+        from graph2mat.bindings.torch import TorchBasisMatrixData, TorchBasisMatrixDataset
+        from metatrain.experimental.graph2mat.utils.dataset import (
+            system_to_config,
+        )
+
+        model = extra_data["model"]
+        matrix_name = "hamiltonian"
+        processor = model.graph2mat_processors[matrix_name]
+        data = model.datas[matrix_name]
+        systems = extra_data["systems"]
+
+        node_target = self.target
+        edge_target = node_target.replace("mtt::matrix_nodes::", "mtt::matrix_edges::")
+        tensor_map_pred = {
+            "node_labels": predictions[node_target].block().values.ravel(),
+            "edge_labels": predictions[edge_target].block().values.ravel(),
+        }
+        tensor_map_targ = {
+            "node_labels": targets[node_target].block().values.ravel(),
+            "edge_labels": targets[edge_target].block().values.ravel(),
+        }
+
+        configs = [
+            system_to_config(
+                system, processor, None
+            )
+            for system in systems
+        ]
+
+        all_data = TorchBasisMatrixDataset(
+            configs,
+            data_processor=processor,
+            data_cls=TorchBasisMatrixData,
+            load_labels=False,
+        )
+
+        preds = []
+        targets = []
+
+        loss = torch.zeros((), dtype=torch.float, device=tensor_map_pred["node_labels"].device)
+
+        for i in range(len(systems)):
+            data = all_data[i]
+            pred = processor.matrix_from_data(data, tensor_map_pred, out_format="torch")
+            target = processor.matrix_from_data(data, tensor_map_targ, out_format="torch")
+            eig, eigv = torch.linalg.eig(target)
+            # Sort eigenvalues and eigenvectors
+            sort_eig, idx = torch.sort(eig.real, descending=False)
+            eigv = eigv[:, idx]
+
+            first_eigvs = eigv[:, sort_eig < 0]
+            target = first_eigvs @ first_eigvs.T
+            target = target.to(pred.dtype)
+
+            loss = loss + ((pred @ target @ pred.T - target) ** 2).sum()
+
+        return loss
+
 class MaskedTensorMapLoss(BaseTensorMapLoss):
     """
     Pointwise masked loss on :py:class:`TensorMap` entries.
@@ -307,6 +401,35 @@ class TensorMapMSELoss(BaseTensorMapLoss):
             weight,
             reduction,
             loss_fn=torch.nn.MSELoss(reduction=reduction),
+        )
+
+class SkipLoss(BaseTensorMapLoss):
+    """
+    Skip loss on :py:class:`TensorMap` entries.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode for torch loss.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        
+        def skip_loss(predictions, targets):
+            return (predictions * 0.0).sum()
+ 
+        super().__init__(
+            name,
+            gradient,
+            weight,
+            reduction,
+            loss_fn=skip_loss,
         )
 
 
@@ -1203,6 +1326,8 @@ class LossType(Enum):
     GAUSSIAN_NLL = ("gaussian_nll_ensemble", TensorMapGaussianNLLLoss)
     GAUSSIAN_CRPS = ("gaussian_crps_ensemble", TensorMapGaussianCRPSLoss)
     EMPIRICAL_CRPS = ("empirical_crps_ensemble", TensorMapEmpiricalCRPSLoss)
+    MATRIX = ("matrix", MatrixLoss)
+    SKIP = ("skip", SkipLoss)
 
     def __init__(self, key: str, cls: Type[LossInterface]) -> None:
         self._key = key
