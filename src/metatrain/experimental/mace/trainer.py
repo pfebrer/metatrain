@@ -48,6 +48,7 @@ from metatrain.utils.neighbor_lists import (
 from metatrain.utils.per_atom import average_by_num_atoms
 from metatrain.utils.scaler import get_remove_scale_transform
 from metatrain.utils.transfer import batch_to
+from metatrain.utils.augmentation import O3Augmenter
 
 from . import checkpoints
 from .documentation import TrainerHypers
@@ -226,6 +227,10 @@ class Trainer(TrainerInterface):
                 train_targets, dataset_info.extra_data
             )
         )
+        extra_data_info = dataset_info.extra_data
+        rotational_augmenter = O3Augmenter(
+            target_info_dict=train_targets, extra_data_info_dict=extra_data_info
+        )
 
         atomic_baseline = self.hypers["atomic_baseline"]
         if isinstance(atomic_baseline, str):
@@ -329,6 +334,7 @@ class Trainer(TrainerInterface):
             target_keys=list(train_targets.keys()),
             callables=[
                 atomic_basis_transform,
+                rotational_augmenter.apply_random_augmentations,
                 get_system_with_neighbor_lists_transform(requested_neighbor_lists),
                 get_remove_additive_transform(additive_models, train_targets),
                 get_remove_scale_transform(scaler),
