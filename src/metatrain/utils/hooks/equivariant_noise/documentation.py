@@ -31,3 +31,6 @@ class Hypers(TypedDict):
 
     outputs: Optional[str | list[str]] = None
     """The names of the outputs to be produced by the hook."""
+
+    max_ell: int = 1
+    """The maximum angular momentum of the noise"""

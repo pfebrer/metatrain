@@ -25,6 +25,7 @@ class Noise(HookInterface[Hypers]):
         super().__init__(hypers, dataset_info)
 
         self.hypers = hypers
+        self.noise_max_ell = hypers.get("max_ell", 1)
 
         # Get the information about the output targets from the dataset info
         out_names = hypers["outputs"]
@@ -63,7 +64,7 @@ class Noise(HookInterface[Hypers]):
                         keys=Labels(
                             names=["o3_lambda", "o3_sigma"],
                             values=torch.tensor(
-                                [[0, 1], [1, 1]],
+                                [[ell, 1] for ell in range(self.noise_max_ell + 1)],
                                 dtype=torch.int64
                             )
                         ),
@@ -73,23 +74,13 @@ class Noise(HookInterface[Hypers]):
                                 components=[
                                     Labels(
                                         ["o3_mu"],
-                                        torch.tensor([[0]], dtype=torch.int64)
+                                        torch.arange(-ell, ell + 1, dtype=torch.int64).reshape(-1, 1)
                                     )
                                 ],
                                 properties=target.layout.block(0).properties,
-                                values=torch.empty((0, 1, target.layout.block(0).properties.values.shape[0]), dtype=torch.float32)
-                            ),
-                            TensorBlock(
-                                samples=target.layout.block(0).samples,
-                                components=[
-                                    Labels(
-                                        ["o3_mu"],
-                                        torch.tensor([[-1], [0], [1]], dtype=torch.int64)
-                                    )
-                                ],
-                                properties=target.layout.block(0).properties,
-                                values=torch.empty((0, 3, target.layout.block(0).properties.values.shape[0]), dtype=torch.float32)
+                                values=torch.empty((0, 2 * ell + 1, target.layout.block(0).properties.values.shape[0]), dtype=torch.float32)
                             )
+                            for ell in range(self.noise_max_ell + 1)
                         ]
                     ),
                 )
@@ -161,13 +152,16 @@ class Noise(HookInterface[Hypers]):
         ):
             if out_name in outputs:
                 layout = self.out_targets[out_name].layout.to(systems[0].positions.device)
-                l1_values = inputs[in_name].block(1).values
-                print("Mean noise level:", abs(l1_values).mean())
+                contribs = [
+                    inputs[in_name].block(ell).values.sum(dim=1)
+                    for ell in range(self.noise_max_ell + 1)
+                ]
+                print("Mean contribs:", [round(abs(values).mean().item(), 3) for values in contribs])
                 return_dict[out_name] = TensorMap(
                     keys=layout.keys,
                     blocks=[
                         TensorBlock(
-                            values=inputs[in_name].block(0).values.sum(dim=1) + l1_values.sum(dim=1),
+                            values=torch.stack(contribs, dim=1).sum(dim=1),
                             samples=inputs[in_name].block(0).samples,
                             components=layout.block(0).components,
                             properties=layout.block(0).properties,
