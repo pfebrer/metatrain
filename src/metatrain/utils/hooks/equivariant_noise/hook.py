@@ -160,16 +160,17 @@ class Noise(HookInterface[Hypers]):
             self._input_target_infos, self.out_targets, strict=True
         ):
             if out_name in outputs:
+                layout = self.out_targets[out_name].layout.to(systems[0].positions.device)
                 l1_values = inputs[in_name].block(1).values
                 print("Mean noise level:", abs(l1_values).mean())
                 return_dict[out_name] = TensorMap(
-                    keys=self.out_targets[out_name].layout.keys,
+                    keys=layout.keys,
                     blocks=[
                         TensorBlock(
                             values=inputs[in_name].block(0).values.sum(dim=1) + l1_values.sum(dim=1),
                             samples=inputs[in_name].block(0).samples,
-                            components=self.out_targets[out_name].layout.block(0).components,
-                            properties=self.out_targets[out_name].layout.block(0).properties,
+                            components=layout.block(0).components,
+                            properties=layout.block(0).properties,
                         )
                     ],
                 )
