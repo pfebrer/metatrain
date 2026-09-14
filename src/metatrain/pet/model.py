@@ -23,8 +23,8 @@ from metatrain.utils.additive import ZBL
 from metatrain.utils.architectures import get_default_hypers
 from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atom_pair_helpers import (
-    check_no_atom_pair_targets,
     get_pair_sample_labels,
+    get_bidirectional_edges
 )
 from metatrain.utils.data.atomic_basis_helpers import (
     densify_atomic_basis_dataset_info,
@@ -32,6 +32,7 @@ from metatrain.utils.data.atomic_basis_helpers import (
 )
 from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.hypers import raise_if_hypers_mismatch
+from metatrain.utils.io import model_from_checkpoint
 from metatrain.utils.long_range import DummyLongRangeFeaturizer, LongRangeFeaturizer
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.sum_over_atoms import sum_over_atoms
@@ -65,7 +66,7 @@ class PET(ModelInterface[ModelHypers]):
         targets.
     """
 
-    __checkpoint_version__ = 16
+    __checkpoint_version__ = 17
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -76,7 +77,6 @@ class PET(ModelInterface[ModelHypers]):
 
     def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
         super().__init__(hypers, dataset_info, self.__default_metadata__)
-        check_no_atom_pair_targets(dataset_info.targets, self.__class__.__name__)
 
         # Cache the hyperparameters that PET itself (as opposed to the pure-PyTorch
         # backend) needs. The remaining hyperparameters are cached on ``self.backend``.
@@ -92,7 +92,6 @@ class PET(ModelInterface[ModelHypers]):
         self.adaptive_cutoff_method = self.hypers["adaptive_cutoff_method"]
         self.d_pet = self.hypers["d_pet"]
         self.d_node = self.hypers["d_node"]
-        self.d_head = self.hypers["d_head"]
         self.num_gnn_layers = self.hypers["num_gnn_layers"]
         self.featurizer_type = self.hypers["featurizer_type"]
 
@@ -116,8 +115,16 @@ class PET(ModelInterface[ModelHypers]):
         self.backend = PETBackend(self.hypers, self.atomic_types)
         self.num_readout_layers = self.backend.num_readout_layers
         self.system_conditioning = self.backend.system_conditioning
-        self.last_layer_feature_size = (
-            self.num_readout_layers * self.d_head * self.NUM_FEATURE_TYPES
+        self.d_head_node = self.backend.d_head_node
+        self.d_head_edge = self.backend.d_head_edge
+        # For LLPR: the last-layer features are the per-layer node and edge head
+        # outputs concatenated, so the two head dimensions are summed rather than
+        # multiplied by ``NUM_FEATURE_TYPES`` (equivalent when ``d_head`` is a
+        # single int). This assumes one head per readout layer; with
+        # ``head_type="per_block"`` the size is ``num_blocks`` times larger and
+        # therefore target-dependent, which this single scalar cannot express.
+        self.last_layer_feature_size = self.num_readout_layers * (
+            self.d_head_node + self.d_head_edge
         )  # for LLPR
 
         # the model is always capable of outputting the internal features
@@ -192,6 +199,24 @@ class PET(ModelInterface[ModelHypers]):
                     ),
                 )
             )
+
+        # Adds a pretrained edge composition model baseline for atom-pair targets, if
+        # requested. Unlike the (per-atom) composition model, atom-pair targets are
+        # never baselined implicitly: PET has no baseline of its own for them, so this
+        # is the only way to remove an additive contribution from them before the
+        # loss. Following the pattern in the `graph2mat` architecture: unlike
+        # composition/ZBL, this is never fit here - it is trained separately (as its
+        # own, standalone `experimental.edge_composition` architecture) and loaded
+        # from a checkpoint, since (a) fitting it requires its own full gradient-based
+        # training loop (learning rate, epochs, ...), not a one-shot closed-form fit,
+        # and (b) it must be trained directly against the atom-pair target's own
+        # (possibly coupled) native layout, which may not match how PET itself is
+        # configured to see that target.
+        if self.hypers["edge_composition"]:
+            edge_composition_ckpt = torch.load(
+                self.hypers["edge_composition"], map_location="cpu", weights_only=False
+            )
+            additive_models.append(model_from_checkpoint(edge_composition_ckpt, "export"))
         self.additive_models = torch.nn.ModuleList(additive_models)
 
         # scaler: this is also handled by the trainer at training time
@@ -530,9 +555,12 @@ class PET(ModelInterface[ModelHypers]):
         # **Stages 3 & 4: Last Layer Features and Atomic Predictions**
         with torch.profiler.record_function("PET::predict"):
             requested_target_names: List[str] = []
+            atom_pair_output_names: List[str] = []
             for name in self.target_names:
                 if name in outputs:
                     requested_target_names.append(name)
+                    if outputs[name].sample_kind == "atom_pair":
+                        atom_pair_output_names.append(name)
             (
                 atomic_predictions,
                 node_last_layer_features_dict,
@@ -545,6 +573,15 @@ class PET(ModelInterface[ModelHypers]):
                 system_indices,
                 requested_target_names,
             )
+
+            pair_sample_labels: Optional[Labels] = None
+            if len(atom_pair_output_names) > 0:
+                pair_sample_labels = get_pair_sample_labels(
+                    sample_labels,
+                    batch_data["centers"],
+                    batch_data["neighbors"],
+                    batch_data["cell_shifts"],
+                )
 
         # **Stage 2: Intermediate Feature Output (Optional)**
         with torch.profiler.record_function("PET::_get_output_features"):
@@ -581,6 +618,7 @@ class PET(ModelInterface[ModelHypers]):
             atomic_predictions_dict = self._get_output_atomic_predictions(
                 atomic_predictions,
                 sample_labels,
+                pair_sample_labels,
                 outputs,
                 selected_atoms,
             )
@@ -633,6 +671,17 @@ class PET(ModelInterface[ModelHypers]):
                         outputs_for_additive_model,
                         selected_atoms,
                     )
+                    # For atom-pair (edge) contributions, restore anything
+                    # dropped by EdgeCompositionModel's own upper-triangular
+                    # masking (same-atom-type-pair samples, and entire missing
+                    # cross-type-ordered blocks alike) - a no-op for any
+                    # contribution this doesn't apply to (per-atom targets,
+                    # coupled-basis output).
+                    for name in additive_contributions:
+                        if self.dataset_info.targets[name].sample_kind == "atom_pair":
+                            additive_contributions[name] = get_bidirectional_edges(
+                                additive_contributions[name]
+                            )
                     for name in additive_contributions:
                         # TODO: uncomment this after metatensor.torch.add
                         # is updated to handle sparse sums
@@ -648,13 +697,61 @@ class PET(ModelInterface[ModelHypers]):
                         output_blocks: List[TensorBlock] = []
                         for k, b in return_dict[name].items():
                             if k in additive_contributions[name].keys:
-                                output_blocks.append(
-                                    _add_block_block(
-                                        b,
-                                        additive_contributions[name]
-                                        .block(k)
-                                        .to(device=b.device, dtype=b.dtype),
+                                contribution_block = (
+                                    additive_contributions[name]
+                                    .block(k)
+                                    .to(device=b.device, dtype=b.dtype)
+                                )
+                                if (
+                                    contribution_block.values.shape[0]
+                                    != b.values.shape[0]
+                                ):
+                                    # The additive model's own sample convention
+                                    # for this block may not exactly match PET's
+                                    # own (e.g. EdgeCompositionModel predicts only
+                                    # one direction per same-atom-type pair - see
+                                    # `radial_to_spherical_harmonics`'s
+                                    # upper-triangular masking - while PET's own
+                                    # edge samples are always bidirectional).
+                                    # Align the contribution to PET's own samples
+                                    # first, treating any sample PET has but the
+                                    # contribution doesn't as a zero contribution
+                                    # (same convention `_pad_block` in
+                                    # `atomic_basis_helpers.py` uses, for a very
+                                    # similar reason, in `sparsify_atomic_basis_
+                                    # target` just above in this same eval-mode
+                                    # path).
+                                    aligned_shape: List[int] = [b.values.shape[0]]
+                                    for c in contribution_block.components:
+                                        aligned_shape.append(len(c))
+                                    aligned_shape.append(
+                                        contribution_block.values.shape[-1]
                                     )
+                                    aligned_values = torch.zeros(
+                                        aligned_shape,
+                                        dtype=contribution_block.values.dtype,
+                                        device=contribution_block.values.device,
+                                    )
+                                    intersection = b.samples.intersection(
+                                        contribution_block.samples
+                                    )
+                                    idxs_target = b.samples.select(intersection)
+                                    idxs_contribution = (
+                                        contribution_block.samples.select(
+                                            intersection
+                                        )
+                                    )
+                                    aligned_values[idxs_target] = (
+                                        contribution_block.values[idxs_contribution]
+                                    )
+                                    contribution_block = TensorBlock(
+                                        values=aligned_values,
+                                        samples=b.samples,
+                                        components=contribution_block.components,
+                                        properties=contribution_block.properties,
+                                    )
+                                output_blocks.append(
+                                    _add_block_block(b, contribution_block)
                                 )
                             else:
                                 output_blocks.append(
@@ -888,22 +985,28 @@ class PET(ModelInterface[ModelHypers]):
         self,
         atomic_predictions: Dict[str, List[torch.Tensor]],
         sample_labels: Labels,
+        pair_sample_labels: Optional[Labels],
         outputs: Dict[str, ModelOutput],
         selected_atoms: Optional[Labels],
     ) -> Dict[str, TensorMap]:
         """
         Wrap the per-block atomic predictions computed by the backend into TensorMaps.
-        Returns per-atom or per-structure predictions based on output configuration.
+        Returns per-atom, per-atom-pair, or per-structure predictions based on output
+        configuration.
 
         :param atomic_predictions: Dictionary mapping output names to lists of per-block
             flat prediction tensors, as returned by :meth:`PETBackend.predict` (the node
             and edge contributions are already summed and rank-2 Cartesian tensors are
             already symmetrized).
         :param sample_labels: Labels for all atoms in the batch [n_atoms, 2].
+        :param pair_sample_labels: Labels for all directed edges in the batch, with
+            columns ``["system", "first_atom", "second_atom", "cell_shift_a",
+            "cell_shift_b", "cell_shift_c"]``. Required (non-``None``) if any
+            requested output has ``sample_kind == "atom_pair"``.
         :param outputs: Dictionary of requested outputs.
         :param selected_atoms: Optional Labels specifying a subset of atoms to include.
         :return: Dictionary mapping requested output names to TensorMaps of
-            predictions, either per-atom or summed over atoms.
+            predictions: per-atom, per-atom-pair, or summed over atoms.
         """
         atomic_predictions_tmap_dict: Dict[str, TensorMap] = {}
         for output_name in self.target_names:
@@ -911,6 +1014,11 @@ class PET(ModelInterface[ModelHypers]):
                 prediction_blocks = atomic_predictions[output_name]
                 blocks: List[TensorBlock] = []
                 block_index = 0
+                if outputs[output_name].sample_kind == "atom_pair":
+                    assert pair_sample_labels is not None
+                    samples = pair_sample_labels
+                else:
+                    samples = sample_labels
                 for shape, components, properties in zip(
                     self.output_shapes[output_name].values(),
                     self.component_labels[output_name],
@@ -920,7 +1028,7 @@ class PET(ModelInterface[ModelHypers]):
                     blocks.append(
                         TensorBlock(
                             values=prediction_blocks[block_index].reshape([-1] + shape),
-                            samples=sample_labels,
+                            samples=samples,
                             components=components,
                             properties=properties,
                         )
@@ -939,12 +1047,13 @@ class PET(ModelInterface[ModelHypers]):
                     tmap, axis="samples", selection=selected_atoms
                 )
 
-        # If per-atom predictions are requested, we return the atomic predictions
-        # tensor maps. Otherwise, we sum the atomic predictions over the atoms
-        # to get the final per-structure predictions for each requested output.
+        # If per-atom or per-atom-pair predictions are requested, we return the atomic
+        # predictions tensor maps as-is. Otherwise, we sum the atomic predictions over
+        # the atoms to get the final per-structure predictions for each requested
+        # output.
 
         for output_name, atomic_property in atomic_predictions_tmap_dict.items():
-            if outputs[output_name].sample_kind == "atom":
+            if outputs[output_name].sample_kind in ("atom", "atom_pair"):
                 atomic_predictions_tmap_dict[output_name] = atomic_property
             else:
                 atomic_predictions_tmap_dict[output_name] = sum_over_atoms(
@@ -1062,12 +1171,18 @@ class PET(ModelInterface[ModelHypers]):
 
         self.outputs[target_name] = ModelOutput(
             unit=target_info.unit,
-            sample_kind="atom",
+            sample_kind=target_info.sample_kind,
             description=target_info.description,
         )
 
-        # The learnable heads and last layers live on the pure-PyTorch backend.
-        self.backend.add_output(target_name, self.output_shapes[target_name])
+        # The learnable heads and last layers live on the pure-PyTorch backend. Node
+        # heads/last-layers are created for atom-pair (edge) targets too (only the
+        # edge contribution is used in the final prediction for them, for now - see
+        # ``PETBackend.predict``).
+        is_atom_pair = target_info.sample_kind == "atom_pair"
+        self.backend.add_output(
+            target_name, self.output_shapes[target_name], is_atom_pair
+        )
 
         # Register last-layer parameters, in the same order as they are returned as
         # last-layer features in the model (the modules live on ``self.backend``).

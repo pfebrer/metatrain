@@ -188,10 +188,17 @@ class Trainer(TrainerInterface[TrainerHypers]):
             target_info_dict=train_targets, extra_data_info_dict=extra_data_info
         )
         requested_neighbor_lists = get_requested_neighbor_lists(model)
+        nl_options = requested_neighbor_lists[0]
         max_atoms = self.hypers["max_atoms_per_batch"]
         atomic_basis_transform, atomic_basis_reverse_transform = (
-            get_prepare_atomic_basis_targets_transform(train_targets, extra_data_info)
+            get_prepare_atomic_basis_targets_transform(
+                train_targets, extra_data_info, nl_options
+            )
         )
+        # Neighbor lists must be computed before `atomic_basis_transform`: padding
+        # per-atom-pair (edge) targets requires reading each system's own neighbor
+        # list to enumerate its edges (see `pad_samples_atomic_basis_target`).
+        nl_transform = get_system_with_neighbor_lists_transform(requested_neighbor_lists)
 
         train_or_load_composition_model(
             composition_model=model.additive_models[0],
@@ -284,10 +291,9 @@ class Trainer(TrainerInterface[TrainerHypers]):
         )
 
         target_keys = list(train_targets.keys())
-        # Shared callables that run after `atomic_basis_transform` (and after
-        # rotational augmentation in training).
+        # Shared callables that run after `nl_transform` and `atomic_basis_transform`
+        # (and after rotational augmentation in training).
         base_callables: List[Callable[..., Any]] = [
-            get_system_with_neighbor_lists_transform(requested_neighbor_lists),
             *conditioning_callables,
             get_remove_additive_transform(additive_models, train_targets),
             get_remove_scale_transform(scaler),
@@ -295,6 +301,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         collate_fn_train = CollateFn(
             target_keys=target_keys,
             callables=[
+                nl_transform,
                 atomic_basis_transform,
                 rotational_augmenter.apply_random_augmentations,
                 *base_callables,
@@ -303,6 +310,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         collate_fn_val = CollateFn(
             target_keys=target_keys,
             callables=[  # no augmentation for validation
+                nl_transform,
                 atomic_basis_transform,
                 *base_callables,
             ],

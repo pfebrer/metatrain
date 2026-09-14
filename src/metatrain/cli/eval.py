@@ -24,6 +24,9 @@ from metatrain.utils.data import (
     read_systems,
     unpack_batch,
 )
+from metatrain.utils.data.atomic_basis_helpers import (
+    get_prepare_atomic_basis_targets_transform,
+)
 from metatrain.utils.data.readers import read_extra_data
 from metatrain.utils.data.target_info import DEPRECATED_METATOMIC_OUTPUT_NAMES
 from metatrain.utils.data.writers import (
@@ -199,6 +202,24 @@ def _eval_targets(
     target_keys = list(model.capabilities().outputs.keys())
     requested_neighbor_lists = get_requested_neighbor_lists(model)
     callables = [get_system_with_neighbor_lists_transform(requested_neighbor_lists)]
+
+    # If any requested target is an atomic-basis target (including atom-pair
+    # targets), prepare it (densify/pad) and reverse the transform (sparsify)
+    # right away, so the on-disk target data goes through the same round-trip
+    # as the model's own (eval-mode) sparsified predictions, keeping both in a
+    # consistent, directly comparable representation.
+    target_info_dict: Dict[str, TargetInfo] = {
+        k: v for k, v in options.items() if isinstance(v, TargetInfo)
+    }
+    if any(info.is_atomic_basis for info in target_info_dict.values()):
+        atomic_basis_transform, atomic_basis_reverse_transform = (
+            get_prepare_atomic_basis_targets_transform(
+                target_info_dict,
+                {},
+                nl_options=requested_neighbor_lists[0],
+            )
+        )
+        callables += [atomic_basis_transform, atomic_basis_reverse_transform]
 
     # Attach additional per-system inputs
     requested_inputs = [
