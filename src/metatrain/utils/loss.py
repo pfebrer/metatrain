@@ -244,6 +244,225 @@ class BaseTensorMapLoss(LossInterface):
         return self.compute_flattened(tensor_map_pred, tensor_map_targ)
 
 
+class MatrixLoss(LossInterface):
+    """
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: dummy here; real weighting in ScheduledLoss.
+    :param reduction: reduction mode for torch loss.
+    :param loss_fn: pre-instantiated torch.nn loss (e.g. MSELoss).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        super().__init__(name, gradient, weight, reduction)
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        """
+        Compute the unmasked pointwise loss.
+
+        :param predictions: mapping of names to :py:class:`TensorMap`.
+        :param targets: mapping of names to :py:class:`TensorMap`.
+        :param extra_data: ignored for unmasked losses.
+        :return: scalar torch.Tensor loss.
+        """
+        from graph2mat.bindings.torch import TorchBasisMatrixData, TorchBasisMatrixDataset
+        from metatrain.experimental.graph2mat.utils.dataset import (
+            system_to_config,
+        )
+
+        model = extra_data["model"]
+        matrix_name = "hamiltonian"
+        processor = model.graph2mat_processors[matrix_name]
+        data = model.datas[matrix_name]
+        systems = extra_data["systems"]
+
+        node_target = self.target
+        edge_target = node_target.replace("mtt::matrix_nodes::", "mtt::matrix_edges::")
+        tensor_map_pred = {
+            "node_labels": predictions[node_target].block().values.ravel(),
+            "edge_labels": predictions[edge_target].block().values.ravel(),
+        }
+        tensor_map_targ = {
+            "node_labels": targets[node_target].block().values.ravel(),
+            "edge_labels": targets[edge_target].block().values.ravel(),
+        }
+
+        configs = [
+            system_to_config(
+                system, processor, None
+            )
+            for system in systems
+        ]
+
+        all_data = TorchBasisMatrixDataset(
+            configs,
+            data_processor=processor,
+            data_cls=TorchBasisMatrixData,
+            load_labels=False,
+        )
+
+        loss = torch.zeros((), dtype=torch.float, device=tensor_map_pred["node_labels"].device)
+
+        for i in range(len(systems)):
+            data = all_data[i]
+            pred = processor.matrix_from_data(data, tensor_map_pred, out_format="torch")
+            target = processor.matrix_from_data(data, tensor_map_targ, out_format="torch")
+            eig, eigv = torch.linalg.eig(target)
+            # Sort eigenvalues and eigenvectors
+            sort_eig, idx = torch.sort(eig.real, descending=False)
+            eigv = eigv[:, idx]
+
+            first_eigvs = eigv[:, sort_eig < 0]
+            target = first_eigvs @ first_eigvs.T
+            target = target.to(pred.dtype)
+
+            loss = loss + ((pred @ target @ pred.T - target) ** 2).sum()
+
+        return loss
+
+class ContractionLoss(LossInterface):
+    """
+    Loss that optimizes contraction coefficients to a minimal basis.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: dummy here; real weighting in ScheduledLoss.
+    :param reduction: reduction mode for torch loss.
+    :param loss_fn: pre-instantiated torch.nn loss (e.g. MSELoss).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        super().__init__(name, gradient, weight, reduction)
+
+    @staticmethod
+    def get_contraction_indices(types, basis_table):
+        """
+        For a given system, get the indices to retrieve from the current
+        basis to get a minimal basis.
+
+        :param types: Atomic types of the system.
+        :param basis_table: The basis table containing the basis information.
+        :return: A tensor of contraction indices.
+        """
+        contraction_indices = []
+
+        basis = basis_table.basis
+
+        i = 0
+        for atom_type in types:
+            atom_basis = basis[basis_table.type_to_index(atom_type)]
+            for mul, ell, _ in atom_basis.basis:
+                if atom_type <= 2 and ell < 1:
+                    contraction_indices.extend(list(range(i, i + 2*ell + 1)))
+                elif atom_type > 2 and ell < 2:
+                    contraction_indices.extend(list(range(i, i + 2*ell + 1)))
+                i += mul * (2 * ell + 1)
+
+        contraction_indices = torch.tensor(contraction_indices, device=types.device)
+        return contraction_indices
+
+    def compute(
+        self,
+        predictions: Dict[str, TensorMap],
+        targets: Dict[str, TensorMap],
+        extra_data: Optional[Any] = None,
+    ) -> torch.Tensor:
+        """
+        Compute the contraction loss.
+
+        :param predictions: mapping of names to :py:class:`TensorMap`.
+        :param targets: mapping of names to :py:class:`TensorMap`.
+        :param extra_data: ignored for unmasked losses.
+        :return: scalar torch.Tensor loss.
+        """
+        from graph2mat.bindings.torch import TorchBasisMatrixData, TorchBasisMatrixDataset
+        from metatrain.experimental.graph2mat.utils.dataset import (
+            system_to_config,
+        )
+        from torch_geometric.loader import DataLoader
+
+        # Get the names of the targets
+        node_target = self.target
+        matrix_name = node_target.replace("mtt::matrix_nodes::", "")
+        edge_target = f"mtt::matrix_edges::{matrix_name}"
+
+        # Get the processor for this matrix from the graph2mat model
+        model = extra_data["model"]
+        processor = model.graph2mat_processors[matrix_name]
+
+        # Parse systems into a graph2mat batch
+        configs = [
+            system_to_config(
+                system, processor, None
+            )
+            for system in extra_data["systems"]
+        ]
+        all_data = TorchBasisMatrixDataset(
+            configs,
+            data_processor=processor,
+            data_cls=TorchBasisMatrixData,
+            load_labels=False,
+        )
+        all_data = DataLoader(all_data, batch_size=len(configs), shuffle=False)
+        configs_batch = next(iter(all_data))
+
+        # Create generators that return the predicted and target matrices for each system in the batch
+        tensor_map_pred = {
+            "node_labels": predictions[node_target].block().values.ravel(),
+            "edge_labels": predictions[edge_target].block().values.ravel(),
+        }
+        tensor_map_targ = {
+            "node_labels": targets[node_target].block().values.ravel(),
+            "edge_labels": targets[edge_target].block().values.ravel(),
+        }
+        Cs = processor.matrix_from_data(configs_batch, tensor_map_pred, out_format="torch")
+        targets = processor.matrix_from_data(configs_batch, tensor_map_targ, out_format="torch")
+
+        loss = torch.zeros((), dtype=torch.float, device=tensor_map_pred["node_labels"].device)
+
+        # Loop over matrices
+        for i, (C, target) in enumerate(zip(Cs, targets)):
+            # For this system, get the indices to contract the basis to a minimal basis
+            contraction_indices = self.get_contraction_indices(extra_data["systems"][i].types, processor.basis_table)
+            C = C[:, contraction_indices]
+
+            # Compute roundtrip transformation (contract and uncontract)
+            CCT = C @ C.T
+
+            # Apply it on the target and add the error to the loss.
+            if False:
+                # This is if one wants to apply the contraction loss on
+                # the eigenvectors of the target instead of the target itself.
+                # (might be better in some cases, to be tested)
+                vals, vecs = torch.linalg.eig(target)
+                Q = vecs[:, abs(vals.real) > 1e-6].real
+                loss = loss + ((CCT @ Q - Q) ** 2).mean()
+            else:
+                loss = loss + ((CCT @ target  - target) ** 2).mean()
+
+            # Print the following to get the MAE on the target after contraction and decontraction
+            # print(f"MAE for contraction loss: {(abs(CCT @ target @ CCT - target)).mean().item()}")
+
+        return loss
+
 class MaskedTensorMapLoss(BaseTensorMapLoss):
     """
     Pointwise masked loss on :py:class:`TensorMap` entries.
@@ -307,6 +526,35 @@ class TensorMapMSELoss(BaseTensorMapLoss):
             weight,
             reduction,
             loss_fn=torch.nn.MSELoss(reduction=reduction),
+        )
+
+class SkipLoss(BaseTensorMapLoss):
+    """
+    Skip loss on :py:class:`TensorMap` entries.
+
+    :param name: key in the predictions/targets dict.
+    :param gradient: optional gradient field name.
+    :param weight: weight of the loss contribution in the final aggregation.
+    :param reduction: reduction mode for torch loss.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gradient: Optional[str],
+        weight: float,
+        reduction: str,
+    ):
+        
+        def skip_loss(predictions, targets):
+            return (predictions * 0.0).sum()
+ 
+        super().__init__(
+            name,
+            gradient,
+            weight,
+            reduction,
+            loss_fn=skip_loss,
         )
 
 
@@ -1203,6 +1451,9 @@ class LossType(Enum):
     GAUSSIAN_NLL = ("gaussian_nll_ensemble", TensorMapGaussianNLLLoss)
     GAUSSIAN_CRPS = ("gaussian_crps_ensemble", TensorMapGaussianCRPSLoss)
     EMPIRICAL_CRPS = ("empirical_crps_ensemble", TensorMapEmpiricalCRPSLoss)
+    MATRIX = ("matrix", MatrixLoss)
+    CONTRACTION = ("contraction", ContractionLoss)
+    SKIP = ("skip", SkipLoss)
 
     def __init__(self, key: str, cls: Type[LossInterface]) -> None:
         self._key = key
