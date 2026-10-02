@@ -242,6 +242,9 @@ def model_from_checkpoint(
 # Registry of models that do not belong to an architecture.
 _MODEL_REGISTRY = {
     "zbl": "metatrain.utils.additive.zbl.ZBL",
+    "flashmd_position_additive": (
+        "metatrain.experimental.flashmd.modules.additive.PositionAdditive"
+    ),
 }
 
 
@@ -269,6 +272,7 @@ def arch_model_from_checkpoint(
 _mtt_model_versions = {
     "pet": 17,
     "llpr": 5,
+    "experimental.flashmd": 6,
 }
 
 
@@ -338,9 +342,13 @@ def _ckpt_from_arch_ckpt(checkpoint: dict) -> dict:
             if k.startswith(f"additive_models.{i}."):
                 additive_model_state_dict[k.replace(f"additive_models.{i}.", "")] = v
 
-    # If the wrapper has no scaler, the model keeps handling its own scaler
-    # (e.g. FlashMD), and its state stays in the model's state dict.
-    if new_ckpt["scaler"] is not None:
+    if new_ckpt["scaler"] is None:
+        if len(scaler_state_dict) > 0:
+            raise ValueError(
+                "The checkpoint contains a scaler state dict, but the model "
+                "does not have a scaler."
+            )
+    else:
         new_ckpt["scaler"]["model_state_dict"] = scaler_state_dict
         new_ckpt["scaler"]["best_model_state_dict"] = scaler_state_dict
 

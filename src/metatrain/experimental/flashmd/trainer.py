@@ -9,14 +9,15 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DistributedSampler
 
-from metatrain.composition import train_or_load_composition_model
+from metatrain.composition import CompositionModel, train_or_load_composition_model
 from metatrain.pet.modules.finetuning import (
     apply_finetuning_strategy,
     compute_stale_targets,
 )
-from metatrain.scaler import train_or_load_scaler
+from metatrain.scaler import Scaler, train_or_load_scaler
 from metatrain.utils.abc import ModelInterface, TrainerInterface
 from metatrain.utils.additive import get_remove_additive_transform
+from metatrain.utils.architectures import get_default_hypers
 from metatrain.utils.augmentation import O3Augmenter
 from metatrain.utils.data import (
     CollateFn,
@@ -53,6 +54,26 @@ from metatrain.utils.wrapper import MetatrainModel
 from . import checkpoints
 from .documentation import ModelHypers, TrainerHypers
 from .model import FlashMD
+from .modules.additive import PositionAdditive
+
+
+def _position_additive_dataset_info(dataset_info: DatasetInfo) -> DatasetInfo:
+    """
+    Get the dataset info for the ``PositionAdditive`` model, which only contains
+    the position and momentum targets.
+
+    :param dataset_info: The full dataset info.
+    :return: The dataset info restricted to the valid targets.
+    """
+    return DatasetInfo(
+        length_unit=dataset_info.length_unit,
+        atomic_types=dataset_info.atomic_types,
+        targets={
+            target_name: target_info
+            for target_name, target_info in dataset_info.targets.items()
+            if PositionAdditive.is_valid_target(target_name, target_info)
+        },
+    )
 
 
 def get_scheduler(
@@ -108,12 +129,26 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
     def setup(
         self, model_hypers: ModelHypers, dataset_info: DatasetInfo
     ) -> MetatrainModel:
-        # FlashMD keeps its additive models and scaler internally (they need
-        # to stay in float64), so the wrapper does not get any.
+        model = FlashMD(hypers=model_hypers, dataset_info=dataset_info)
+
+        # Set up additive models
+        composition_model = CompositionModel.from_valid_targets(
+            dataset_info, dataset_info.atomic_types
+        )
+        position_additive = PositionAdditive(
+            hypers={"also_momenta": model_hypers["predict_momenta_as_difference"]},
+            dataset_info=_position_additive_dataset_info(dataset_info),
+        )
+        additive_models = [composition_model, position_additive]
+
+        # Initialize scaler
+        scaler_hypers = get_default_hypers("scaler")["model"]
+        scaler = Scaler(hypers=scaler_hypers, dataset_info=dataset_info)
+
         return MetatrainModel(
-            model=FlashMD(hypers=model_hypers, dataset_info=dataset_info),
-            additive_models=[],
-            scaler=None,
+            model=model,
+            additive_models=additive_models,
+            scaler=scaler,
             dataset_info=dataset_info,
         )
 
@@ -132,6 +167,10 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
             model.dataset_info.targets, dataset_info.targets
         )
         model.restart(dataset_info, model_hypers=model_hypers)
+        # ``MetatrainModel.restart`` only restarts the composition model
+        model.additive_models[1] = model.additive_models[1].restart(
+            _position_additive_dataset_info(dataset_info)
+        )
         return model
 
     def train(
@@ -144,7 +183,6 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
         checkpoint_dir: str,
     ):
         assert dtype in FlashMD.__supported_dtypes__
-        flashmd = model.model
 
         # Set time step for the model
         if self.hypers["timestep"] is None:
@@ -158,7 +196,7 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
                 "details, see the FlashMD tutorial in the documentation."
             )
         else:
-            flashmd.set_timestep(self.hypers["timestep"])
+            model.model.set_timestep(self.hypers["timestep"])
 
         # Set masses for the model
         if len(self.hypers["masses"]) == 0:
@@ -172,7 +210,7 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
             )
             for atomic_number in model.dataset_info.atomic_types
         }
-        flashmd.set_masses(atomic_mass_dict)
+        model.model.set_masses(atomic_mass_dict)
 
         is_distributed = resolve_distributed(self.hypers.get("distributed"))
         is_finetune = self.hypers["finetune"]["read_from"] is not None
@@ -234,15 +272,15 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
         # The additive models of FlashMD are always in float64 (to avoid numerical
         # errors in the addition of positions and/or momenta to their variations
         # as predicted by the model).
-        for additive_model in flashmd.additive_models:
+        for additive_model in model.additive_models:
             additive_model.to(dtype=torch.float64)
-        flashmd.scaler.to(dtype=torch.float64)
+        model.scaler.to(dtype=torch.float64)
 
         train_or_load_composition_model(
-            composition_model=flashmd.additive_models[0],
+            composition_model=model.additive_models[0],
             atomic_baseline=self.hypers["atomic_baseline"],
             train_datasets=train_datasets,
-            other_additive_models=list(flashmd.additive_models[1:]),
+            other_additive_models=list(model.additive_models[1:]),
             batch_size=self.hypers["batch_size"],
             is_distributed=is_distributed,
             checkpoint_dir=checkpoint_dir,
@@ -258,14 +296,14 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
                 )
             train_or_load_scaler(
                 scaler=MetatrainModel(
-                    model=flashmd.scaler,
+                    model=model.scaler,
                     additive_models=[],
                     scaler=None,
                     dataset_info=model.dataset_info,
                 ),
                 fixed_weights=self.hypers["fixed_scaling_weights"],
                 train_datasets=train_datasets,
-                additive_models=flashmd.additive_models,
+                additive_models=model.additive_models,
                 batch_size=self.hypers["batch_size"],
                 is_distributed=is_distributed,
                 checkpoint_dir=checkpoint_dir,
@@ -301,16 +339,16 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
 
         # Extract additive models and scaler and move them to CPU/float64 so they
         # can be used in the collate function
-        flashmd.additive_models[0].weights_to(device="cpu", dtype=torch.float64)
+        model.additive_models[0].weights_to(device="cpu", dtype=torch.float64)
         additive_models = copy.deepcopy(
-            flashmd.additive_models.to(dtype=torch.float64, device="cpu")
+            model.additive_models.to(dtype=torch.float64, device="cpu")
         )
-        flashmd.additive_models.to(device)
-        flashmd.additive_models[0].weights_to(device=device, dtype=torch.float64)
-        flashmd.scaler.scales_to(device="cpu", dtype=torch.float64)
-        scaler = copy.deepcopy(flashmd.scaler.to(dtype=torch.float64, device="cpu"))
-        flashmd.scaler.to(device)
-        flashmd.scaler.scales_to(device=device, dtype=torch.float64)
+        model.additive_models.to(device)
+        model.additive_models[0].weights_to(device=device, dtype=torch.float64)
+        model.scaler.scales_to(device="cpu", dtype=torch.float64)
+        scaler = copy.deepcopy(model.scaler.to(dtype=torch.float64, device="cpu"))
+        model.scaler.to(device)
+        model.scaler.scales_to(device=device, dtype=torch.float64)
 
         # Create collate functions:
         dataset_info = model.dataset_info
@@ -474,7 +512,9 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
                 # not per-property. This transformation only applies to targets with
                 # per-property scales (i.e. multiple blocks or multiple properties), and
                 # leaves the others unchanged.
-                predictions = flashmd.scaler.apply_scales(
+                predictions = (
+                    model.module if is_distributed else model
+                ).scaler.apply_scales(
                     systems,
                     predictions,
                     remove=False,
@@ -507,14 +547,18 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
                 # Reapply scales and accumulate quantities for computing train metrics,
                 # but only if this is an epoch to log
                 if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
-                    scaled_predictions = flashmd.scaler.apply_scales(
+                    scaled_predictions = (
+                        model.module if is_distributed else model
+                    ).scaler.apply_scales(
                         systems,
                         predictions,
                         remove=False,
                         use_per_target_scales=True,
                         use_per_property_scales=False,
                     )
-                    scaled_targets = flashmd.scaler.apply_scales(
+                    scaled_targets = (
+                        model.module if is_distributed else model
+                    ).scaler.apply_scales(
                         systems,
                         targets,
                         remove=False,
@@ -575,7 +619,9 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
                     # per-target, and not per-property. This transformation only applies
                     # to targets with per-property scales (i.e. multiple blocks or
                     # multiple properties), and leaves the others unchanged.
-                    predictions = flashmd.scaler.apply_scales(
+                    predictions = (
+                        model.module if is_distributed else model
+                    ).scaler.apply_scales(
                         systems,
                         predictions,
                         remove=False,
@@ -593,14 +639,18 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
                     # Reapply scales and accumulate quantities for computing val
                     # metrics. This is done for every epoch as validation metrics are
                     # needed for model selection
-                    scaled_predictions = flashmd.scaler.apply_scales(
+                    scaled_predictions = (
+                        model.module if is_distributed else model
+                    ).scaler.apply_scales(
                         systems,
                         predictions,
                         remove=False,
                         use_per_target_scales=True,
                         use_per_property_scales=False,
                     )
-                    scaled_targets = flashmd.scaler.apply_scales(
+                    scaled_targets = (
+                        model.module if is_distributed else model
+                    ).scaler.apply_scales(
                         systems,
                         targets,
                         remove=False,
