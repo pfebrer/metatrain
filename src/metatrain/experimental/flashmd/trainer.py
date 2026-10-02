@@ -10,7 +10,10 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DistributedSampler
 
 from metatrain.composition import train_or_load_composition_model
-from metatrain.pet.modules.finetuning import apply_finetuning_strategy
+from metatrain.pet.modules.finetuning import (
+    apply_finetuning_strategy,
+    compute_stale_targets,
+)
 from metatrain.scaler import train_or_load_scaler
 from metatrain.utils.abc import ModelInterface, TrainerInterface
 from metatrain.utils.additive import get_remove_additive_transform
@@ -19,6 +22,7 @@ from metatrain.utils.data import (
     CollateFn,
     CombinedDataLoader,
     Dataset,
+    DatasetInfo,
     build_train_dataloaders,
     build_val_dataloaders,
     get_num_workers,
@@ -44,9 +48,10 @@ from metatrain.utils.neighbor_lists import (
 from metatrain.utils.per_atom import average_by_num_atoms
 from metatrain.utils.scaler import get_remove_scale_transform
 from metatrain.utils.transfer import batch_to
+from metatrain.utils.wrapper import MetatrainModel
 
 from . import checkpoints
-from .documentation import TrainerHypers
+from .documentation import ModelHypers, TrainerHypers
 from .model import FlashMD
 
 
@@ -83,7 +88,7 @@ def get_scheduler(
     return scheduler
 
 
-class Trainer(TrainerInterface[TrainerHypers]):
+class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
     __checkpoint_version__ = 7
 
     def __init__(self, hypers: TrainerHypers) -> None:
@@ -97,9 +102,41 @@ class Trainer(TrainerInterface[TrainerHypers]):
         self.best_model_state_dict: Optional[Dict[str, Any]] = None
         self.best_optimizer_state_dict: Optional[Dict[str, Any]] = None
 
+        self.has_new_targets = False
+        self._stale_finetune_targets: List[str] = []
+
+    def setup(
+        self, model_hypers: ModelHypers, dataset_info: DatasetInfo
+    ) -> MetatrainModel:
+        # FlashMD keeps its additive models and scaler internally (they need
+        # to stay in float64), so the wrapper does not get any.
+        return MetatrainModel(
+            model=FlashMD(hypers=model_hypers, dataset_info=dataset_info),
+            additive_models=[],
+            scaler=None,
+            dataset_info=dataset_info,
+        )
+
+    def restart(
+        self,
+        model: MetatrainModel,
+        dataset_info: DatasetInfo,
+        model_hypers: ModelHypers,
+    ) -> MetatrainModel:
+        merged_info = model.dataset_info.union(dataset_info)
+        self.has_new_targets = any(
+            key not in model.dataset_info.targets for key in merged_info.targets
+        )
+        # Stale targets are only removed later, by ``apply_finetuning_strategy``
+        self._stale_finetune_targets = compute_stale_targets(
+            model.dataset_info.targets, dataset_info.targets
+        )
+        model.restart(dataset_info, model_hypers=model_hypers)
+        return model
+
     def train(
         self,
-        model: FlashMD,
+        model: MetatrainModel,
         dtype: torch.dtype,
         devices: List[torch.device],
         train_datasets: List[Union[Dataset, torch.utils.data.Subset]],
@@ -107,6 +144,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         checkpoint_dir: str,
     ):
         assert dtype in FlashMD.__supported_dtypes__
+        flashmd = model.model
 
         # Set time step for the model
         if self.hypers["timestep"] is None:
@@ -120,7 +158,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 "details, see the FlashMD tutorial in the documentation."
             )
         else:
-            model.set_timestep(self.hypers["timestep"])
+            flashmd.set_timestep(self.hypers["timestep"])
 
         # Set masses for the model
         if len(self.hypers["masses"]) == 0:
@@ -134,7 +172,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
             )
             for atomic_number in model.dataset_info.atomic_types
         }
-        model.set_masses(atomic_mass_dict)
+        flashmd.set_masses(atomic_mass_dict)
 
         is_distributed = resolve_distributed(self.hypers.get("distributed"))
         is_finetune = self.hypers["finetune"]["read_from"] is not None
@@ -177,6 +215,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 model,
                 self.hypers["finetune"],
                 apply_inherit_heads=self.optimizer_state_dict is None,
+                stale_targets=self._stale_finetune_targets,
             )
             method = self.hypers["finetune"]["method"]
             num_params = sum(p.numel() for p in model.parameters())
@@ -195,15 +234,15 @@ class Trainer(TrainerInterface[TrainerHypers]):
         # The additive models of FlashMD are always in float64 (to avoid numerical
         # errors in the addition of positions and/or momenta to their variations
         # as predicted by the model).
-        for additive_model in model.additive_models:
+        for additive_model in flashmd.additive_models:
             additive_model.to(dtype=torch.float64)
-        model.scaler.to(dtype=torch.float64)
+        flashmd.scaler.to(dtype=torch.float64)
 
         train_or_load_composition_model(
-            composition_model=model.additive_models[0],
+            composition_model=flashmd.additive_models[0],
             atomic_baseline=self.hypers["atomic_baseline"],
             train_datasets=train_datasets,
-            other_additive_models=list(model.additive_models[1:]),
+            other_additive_models=list(flashmd.additive_models[1:]),
             batch_size=self.hypers["batch_size"],
             is_distributed=is_distributed,
             checkpoint_dir=checkpoint_dir,
@@ -218,10 +257,15 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     "a checkpoint also for the composition model."
                 )
             train_or_load_scaler(
-                scaler=model.scaler,
+                scaler=MetatrainModel(
+                    model=flashmd.scaler,
+                    additive_models=[],
+                    scaler=None,
+                    dataset_info=model.dataset_info,
+                ),
                 fixed_weights=self.hypers["fixed_scaling_weights"],
                 train_datasets=train_datasets,
-                additive_models=model.additive_models,
+                additive_models=flashmd.additive_models,
                 batch_size=self.hypers["batch_size"],
                 is_distributed=is_distributed,
                 checkpoint_dir=checkpoint_dir,
@@ -257,16 +301,16 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         # Extract additive models and scaler and move them to CPU/float64 so they
         # can be used in the collate function
-        model.additive_models[0].weights_to(device="cpu", dtype=torch.float64)
+        flashmd.additive_models[0].weights_to(device="cpu", dtype=torch.float64)
         additive_models = copy.deepcopy(
-            model.additive_models.to(dtype=torch.float64, device="cpu")
+            flashmd.additive_models.to(dtype=torch.float64, device="cpu")
         )
-        model.additive_models.to(device)
-        model.additive_models[0].weights_to(device=device, dtype=torch.float64)
-        model.scaler.scales_to(device="cpu", dtype=torch.float64)
-        scaler = copy.deepcopy(model.scaler.to(dtype=torch.float64, device="cpu"))
-        model.scaler.to(device)
-        model.scaler.scales_to(device=device, dtype=torch.float64)
+        flashmd.additive_models.to(device)
+        flashmd.additive_models[0].weights_to(device=device, dtype=torch.float64)
+        flashmd.scaler.scales_to(device="cpu", dtype=torch.float64)
+        scaler = copy.deepcopy(flashmd.scaler.to(dtype=torch.float64, device="cpu"))
+        flashmd.scaler.to(device)
+        flashmd.scaler.scales_to(device=device, dtype=torch.float64)
 
         # Create collate functions:
         dataset_info = model.dataset_info
@@ -369,7 +413,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
         if self.optimizer_state_dict is not None and not is_finetune:
             # try to load the optimizer state dict, but this is only possible
             # if there are no new targets in the model (new parameters)
-            if not (model.module if is_distributed else model).has_new_targets:
+            if not self.has_new_targets:
                 optimizer.load_state_dict(self.optimizer_state_dict)
 
         # Create a learning rate scheduler
@@ -377,7 +421,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
 
         if self.scheduler_state_dict is not None and not is_finetune:
             # same as the optimizer, try to load the scheduler state dict
-            if not (model.module if is_distributed else model).has_new_targets:
+            if not self.has_new_targets:
                 lr_scheduler.load_state_dict(self.scheduler_state_dict)
 
         per_structure_targets = self.hypers["per_structure_targets"]
@@ -430,9 +474,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 # not per-property. This transformation only applies to targets with
                 # per-property scales (i.e. multiple blocks or multiple properties), and
                 # leaves the others unchanged.
-                predictions = (
-                    model.module if is_distributed else model
-                ).scaler.apply_scales(
+                predictions = flashmd.scaler.apply_scales(
                     systems,
                     predictions,
                     remove=False,
@@ -465,18 +507,14 @@ class Trainer(TrainerInterface[TrainerHypers]):
                 # Reapply scales and accumulate quantities for computing train metrics,
                 # but only if this is an epoch to log
                 if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
-                    scaled_predictions = (
-                        model.module if is_distributed else model
-                    ).scaler.apply_scales(
+                    scaled_predictions = flashmd.scaler.apply_scales(
                         systems,
                         predictions,
                         remove=False,
                         use_per_target_scales=True,
                         use_per_property_scales=False,
                     )
-                    scaled_targets = (
-                        model.module if is_distributed else model
-                    ).scaler.apply_scales(
+                    scaled_targets = flashmd.scaler.apply_scales(
                         systems,
                         targets,
                         remove=False,
@@ -537,9 +575,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     # per-target, and not per-property. This transformation only applies
                     # to targets with per-property scales (i.e. multiple blocks or
                     # multiple properties), and leaves the others unchanged.
-                    predictions = (
-                        model.module if is_distributed else model
-                    ).scaler.apply_scales(
+                    predictions = flashmd.scaler.apply_scales(
                         systems,
                         predictions,
                         remove=False,
@@ -557,18 +593,14 @@ class Trainer(TrainerInterface[TrainerHypers]):
                     # Reapply scales and accumulate quantities for computing val
                     # metrics. This is done for every epoch as validation metrics are
                     # needed for model selection
-                    scaled_predictions = (
-                        model.module if is_distributed else model
-                    ).scaler.apply_scales(
+                    scaled_predictions = flashmd.scaler.apply_scales(
                         systems,
                         predictions,
                         remove=False,
                         use_per_target_scales=True,
                         use_per_property_scales=False,
                     )
-                    scaled_targets = (
-                        model.module if is_distributed else model
-                    ).scaler.apply_scales(
+                    scaled_targets = flashmd.scaler.apply_scales(
                         systems,
                         targets,
                         remove=False,
@@ -660,7 +692,7 @@ class Trainer(TrainerInterface[TrainerHypers]):
     def save_checkpoint(self, model: ModelInterface, path: Union[str, Path]) -> None:
         checkpoint = model.get_checkpoint()
         if self.best_model_state_dict is not None:
-            self.best_model_state_dict["finetune_config"] = model.finetune_config
+            self.best_model_state_dict["finetune_config"] = model.model.finetune_config
         checkpoint.update(
             {
                 "trainer_ckpt_version": self.__checkpoint_version__,

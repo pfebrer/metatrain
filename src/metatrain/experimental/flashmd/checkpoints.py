@@ -156,6 +156,18 @@ def model_update_v4_v5(checkpoint: dict) -> None:
                     state_dict[new_key] = value
 
 
+def model_update_v5_v6(checkpoint: dict) -> None:
+    """
+    Update a v5 checkpoint to v6.
+
+    Nothing changes inside the FlashMD checkpoint itself: from v6 on, it is
+    stored inside a ``MetatrainModel`` checkpoint, and the conversion of old
+    checkpoints to that format is handled when loading them.
+
+    :param checkpoint: The checkpoint to update.
+    """
+
+
 ###########################
 # TRAINER #################
 ###########################

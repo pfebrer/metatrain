@@ -18,10 +18,7 @@ from metatomic.torch import (
 from torch.profiler import record_function
 
 from metatrain.composition import CompositionModel
-from metatrain.pet.modules.finetuning import (
-    apply_finetuning_strategy,
-    compute_stale_targets,
-)
+from metatrain.pet.modules.finetuning import apply_finetuning_strategy
 from metatrain.pet.modules.transformer import CartesianTransformer
 from metatrain.pet.modules.utilities import cutoff_func_cosine as cutoff_func
 from metatrain.scaler import Scaler
@@ -52,7 +49,7 @@ class FlashMD(ModelInterface[ModelHypers]):
     For more information, you can refer to https://arxiv.org/abs/2505.19350.
     """
 
-    __checkpoint_version__ = 5
+    __checkpoint_version__ = 6
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -255,15 +252,6 @@ class FlashMD(ModelInterface[ModelHypers]):
             for key, value in merged_info.targets.items()
             if key not in self.dataset_info.targets
         }
-        self.has_new_targets = len(new_targets) > 0
-
-        # Targets that were present before this run but are not part of the current
-        # run's dataset: with a backbone-altering finetuning method (full/lora), their
-        # heads are no longer meaningful and are dropped once training starts, by
-        # ``apply_finetuning_strategy`` (which decides based on the method).
-        stale_targets = compute_stale_targets(
-            self.dataset_info.targets, dataset_info.targets
-        )
 
         if len(new_atomic_types) > 0:
             raise ValueError(
@@ -302,12 +290,6 @@ class FlashMD(ModelInterface[ModelHypers]):
             ),
         )
         self.scaler = self.scaler.restart(dataset_info)
-
-        # Actual removal (if any) is deferred to ``apply_finetuning_strategy``
-        # (called later, once training starts), since ``inherit_heads`` needs these
-        # stale targets' heads to still be around to copy weights from, and only
-        # backbone-altering methods (``full``/``lora``) actually drop them.
-        self._stale_finetune_targets = stale_targets
 
         return self
 
@@ -1361,6 +1343,14 @@ class FlashMD(ModelInterface[ModelHypers]):
         self.key_labels.pop(target_name, None)
         self.component_labels.pop(target_name, None)
         self.property_labels.pop(target_name, None)
+        if target_name in self.target_names:
+            self.target_names.remove(target_name)
+        self.dataset_info.targets.pop(target_name, None)
+        for additive_model in self.additive_models:
+            if target_name in additive_model.outputs:
+                additive_model.remove_output(target_name)
+        if target_name in self.scaler.outputs:
+            self.scaler.remove_output(target_name)
 
     def _move_labels_to_device(self, device: torch.device) -> None:
         self.single_label = self.single_label.to(device)
