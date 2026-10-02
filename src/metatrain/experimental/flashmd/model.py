@@ -48,6 +48,8 @@ class FlashMD(ModelInterface[ModelHypers]):
     __checkpoint_version__ = 6
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
+    # read by downstream integrators from the exported module
+    __exported_buffers__ = ["timestep"]
     __default_metadata__ = ModelMetadata(
         references={"architecture": ["https://arxiv.org/abs/2505.19350"]}
     )
