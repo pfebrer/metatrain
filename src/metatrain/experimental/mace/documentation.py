@@ -301,6 +301,9 @@ class ModelHypers(TypedDict):
 
 
 class TrainerHypers(TypedDict):
+
+    microdose: bool = False
+    """Whether to use microdosing training."""
     # Optimizer hypers (directly using MACE's scripts)
     optimizer: Literal["adam", "adamw", "schedulefree"] = "adam"
     """Optimizer for parameter optimization"""

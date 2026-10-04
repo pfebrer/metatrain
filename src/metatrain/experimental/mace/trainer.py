@@ -11,6 +11,7 @@ from mace.tools.scripts_utils import (
     get_params_options,
 )
 from torch.utils.data import DistributedSampler
+from e3nn import o3
 
 from metatrain.composition import train_or_load_composition_model
 from metatrain.scaler import train_or_load_scaler
@@ -142,6 +143,17 @@ def get_optimizer_and_scheduler(
 
     return optimizer, scheduler
 
+def microdose_module(module):
+    o3_linear_layers = []
+    for name, child in module.named_children():
+        if isinstance(child, o3.Linear):
+            o3_linear_layers.append((name, child))
+            torch_lin = torch.nn.Linear(child.irreps_in.dim, child.irreps_out.dim, bias=False)
+            setattr(module, name, torch_lin)
+        else:
+            o3_linear_layers.extend(microdose_module(child))
+    return o3_linear_layers
+
 
 class Trainer(TrainerInterface):
     __checkpoint_version__ = 4
@@ -171,6 +183,9 @@ class Trainer(TrainerInterface):
 
         is_distributed = resolve_distributed(self.hypers.get("distributed"))
         is_finetune = "finetune" in self.hypers
+
+        if self.hypers["microdose"]:
+            microdose_module(model)
 
         if is_distributed:
             if len(devices) > 1:
