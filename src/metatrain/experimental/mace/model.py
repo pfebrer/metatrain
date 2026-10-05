@@ -51,6 +51,16 @@ from .utils.mts import (
 )
 from .utils.structures import create_batch
 
+def microdose_module(module):
+    o3_linear_layers = []
+    for name, child in module.named_children():
+        if isinstance(child, o3.Linear):
+            o3_linear_layers.append((name, child))
+            torch_lin = torch.nn.Linear(child.irreps_in.dim, child.irreps_out.dim, bias=False)
+            setattr(module, name, torch_lin)
+        else:
+            o3_linear_layers.extend(microdose_module(child))
+    return o3_linear_layers
 
 class MetaMACE(ModelInterface[ModelHypers]):
     """Interface of MACE for metatrain."""
@@ -642,6 +652,10 @@ class MetaMACE(ModelInterface[ModelHypers]):
         # Create the model
         model_data = checkpoint["model_data"]
         model = cls(**model_data)
+
+        if checkpoint["train_hypers"]["microdose"]:
+            microdose_module(model)
+        
         # Infer dtype
         dtype = None
         has_stored_mace = model_data["hypers"]["mace_model"] is not None
