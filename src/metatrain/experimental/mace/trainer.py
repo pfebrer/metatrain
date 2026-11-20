@@ -56,6 +56,7 @@ from metatrain.utils.per_atom import average_by_num_atoms
 from metatrain.utils.scaler import get_remove_scale_transform
 from metatrain.utils.transfer import batch_to
 from metatrain.utils.wrapper import MetatrainModel
+from metatrain.utils.data.atom_pair_helpers import get_pair_target_neighborlist
 
 from . import checkpoints
 from .documentation import ModelHypers, TrainerHypers
@@ -363,6 +364,7 @@ class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
             get_prepare_atomic_basis_targets_transform(
                 model.dataset_info,
                 model.internal_dataset_info(),
+                nl_options=get_pair_target_neighborlist(model)
             )
         )
 
