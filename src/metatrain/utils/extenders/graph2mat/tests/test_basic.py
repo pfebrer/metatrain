@@ -1,13 +1,13 @@
 import pytest
 
-from metatrain.utils.hooks.testing.hook import HookTests
-from metatrain.utils.hooks.testing.inputs import InputTests
-from metatrain.utils.hooks.testing.output import OutputTests
-from metatrain.utils.hooks.testing.torchscript import TorchscriptTests
+from metatrain.utils.extenders.testing.extender import ExtenderTests
+from metatrain.utils.extenders.testing.inputs import InputTests
+from metatrain.utils.extenders.testing.output import OutputTests
+from metatrain.utils.extenders.testing.torchscript import TorchscriptTests
 
 
-class Graph2MatTests(HookTests):
-    hook = "graph2mat"
+class Graph2MatTests(ExtenderTests):
+    extender = "graph2mat"
 
     @pytest.fixture
     def hypers(self):

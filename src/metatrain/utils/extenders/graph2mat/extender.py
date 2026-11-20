@@ -16,18 +16,18 @@ from metatrain.utils.data import DatasetInfo, TargetInfo
 from metatrain.utils.data.atom_pair_helpers import get_pair_sample_labels
 from metatrain.utils.data.atomic_basis_helpers import get_per_atom_sample_labels
 
-from ..abc import HookInterface
+from ..abc import ExtenderInterface
 from .documentation import Hypers
 from .utils.edge_embeddings import RadialEmbeddingBlock
 from .utils.edge_operations import MACEEdgeState
 from .utils.structures import get_edge_vectors_and_lengths
 
 
-class Graph2MatHook(HookInterface[Hypers]):
+class Graph2Mat(ExtenderInterface[Hypers]):
     """
     Passes the inputs to the outputs without any modification.
 
-    :param hypers: A dictionary with the hook's hyper-parameters.
+    :param hypers: A dictionary with the extender's hyper-parameters.
     :param dataset_info: Information containing details about the dataset, such as
         target quantities and atomic types.
     """
@@ -42,7 +42,7 @@ class Graph2MatHook(HookInterface[Hypers]):
         if isinstance(out_names, str):
             out_names = [out_names]
         if out_names is None:
-            raise ValueError("Graph2mat hook requires at least one output target")
+            raise ValueError("Graph2mat extender requires at least one output target")
 
         # Modules to embed edges
         self.spherical_harmonics = SphericalHarmonics(
@@ -63,7 +63,7 @@ class Graph2MatHook(HookInterface[Hypers]):
             strict=True,
         )
 
-        # Build the target infos that the hook will request.
+        # Build the target infos that the extender will request.
         self.out_targets = {}
         self._input_target_infos = {}
         operations = []
@@ -74,9 +74,10 @@ class Graph2MatHook(HookInterface[Hypers]):
             self.out_targets[out_name] = target
             node_irreps = self.hypers["node_hidden_irreps"]
             layout = get_e3nn_mts_layout(
+                o3.Irreps(node_irreps),
                 "mtt::aux::graph2mat::node_states",
                 {
-                    "type": {"spherical": {"irreps": node_irreps}},
+                    "type": "spherical",
                     "sample_kind": "atom",
                     "properties_name": "feature",
                 },
@@ -107,37 +108,18 @@ class Graph2MatHook(HookInterface[Hypers]):
 
         self.operations = torch.nn.ModuleList(operations)
 
-        torch.jit.script(self)
+    def requested_extender_inputs(
+        self, outputs: Optional[dict[str, ModelOutput]] = None
+    ) -> dict[str, TargetInfo]:
+        if outputs is None:
+            return self._input_target_infos
 
-    def requested_target_infos(self) -> dict[str, TargetInfo]:
-        """
-        Returns the list of requested target infos for the hook.
-
-        :return: A list of requested target names.
-        """
-        return self._input_target_infos
-
-    def requested_hook_inputs(
-        self, outputs: dict[str, ModelOutput]
-    ) -> dict[str, ModelOutput]:
-        """
-        Returns the list of requested inputs for the hook.
-
-        :param outputs: Dictionary of requested outputs. These can contain outputs that
-            are handled by other hooks or the main model. In that case, the hook
-            ignores those outputs.
-        :return: A list of requested input names.
-        """
-        req_inputs: dict[str, ModelOutput] = {}
+        req_inputs: dict[str, TargetInfo] = {}
         for out_name, (in_name, target_info) in zip(
             self.out_targets, self._input_target_infos.items(), strict=True
         ):
             if out_name in outputs:
-                req_inputs[in_name] = ModelOutput(
-                    quantity=target_info.quantity,
-                    unit=target_info.unit,
-                    sample_kind=target_info.sample_kind,
-                )
+                req_inputs[in_name] = target_info
 
         return req_inputs
 
@@ -146,20 +128,14 @@ class Graph2MatHook(HookInterface[Hypers]):
     ) -> list[NeighborListOptions]:
         return [self.requested_nl]
 
-    def supported_outputs(self) -> dict[str, ModelOutput]:
+    def supported_outputs(self) -> dict[str, TargetInfo]:
         """
-        Returns the supported outputs for the hook.
+        Returns the supported outputs for the extender.
 
-        :return: A list of supported output names.
+        :return: A dictionary containing the supported outputs
+          for the extender.
         """
-        return {
-            out_name: ModelOutput(
-                quantity=target_info.quantity,
-                unit=target_info.unit,
-                sample_kind=target_info.sample_kind,
-            )
-            for out_name, target_info in self.out_targets.items()
-        }
+        return self.out_targets
 
     def forward(
         self,
@@ -173,7 +149,7 @@ class Graph2MatHook(HookInterface[Hypers]):
 
         if selected_atoms is not None:
             raise NotImplementedError(
-                "Graph2mat hook does not support selected_atoms yet."
+                "Graph2mat extender does not support selected_atoms yet."
             )
 
         batch_data = create_batch(
@@ -244,15 +220,15 @@ class Graph2MatHook(HookInterface[Hypers]):
 
     def get_checkpoint(self, best_state_dict: Optional[dict[str, Any]] = None) -> dict:
         """
-        Get the checkpoint of the hook.
+        Get the checkpoint of the extender.
 
-        :return: A dictionary containing the state of the hook.
+        :return: A dictionary containing the state of the extender.
         """
         state_dict = self.state_dict()
         return {
-            "hook_name": "graph2mat",
-            "hook_ckpt_version": self.__checkpoint_version__,
-            "hook_data": {
+            "extender_name": "graph2mat",
+            "extender_ckpt_version": self.__checkpoint_version__,
+            "extender_data": {
                 "hypers": self.hypers,
                 "dataset_info": self.dataset_info,
             },
@@ -264,21 +240,21 @@ class Graph2MatHook(HookInterface[Hypers]):
         cls, checkpoint: dict[str, Any], context: str
     ) -> "Graph2MatHook":
         """
-        Load the checkpoint of the hook.
+        Load the checkpoint of the extender.
 
-        :param checkpoint: A dictionary containing the state of the hook.
+        :param checkpoint: A dictionary containing the state of the extender.
         """
-        if checkpoint["hook_ckpt_version"] != cls.__checkpoint_version__:
+        if checkpoint["extender_ckpt_version"] != cls.__checkpoint_version__:
             raise ValueError(
-                f"Invalid checkpoint version for the hook: "
+                f"Invalid checkpoint version for the extender: "
                 f"expected {cls.__checkpoint_version__}, got "
-                f"{checkpoint['hook_ckpt_version']}"
+                f"{checkpoint['extender_ckpt_version']}"
             )
 
-        hook = cls(
-            hypers=checkpoint["hook_data"]["hypers"],
-            dataset_info=checkpoint["hook_data"]["dataset_info"],
+        extender = cls(
+            hypers=checkpoint["extender_data"]["hypers"],
+            dataset_info=checkpoint["extender_data"]["dataset_info"],
         )
 
-        hook.load_state_dict(checkpoint["model_state_dict"])
-        return hook
+        extender.load_state_dict(checkpoint["model_state_dict"])
+        return extender

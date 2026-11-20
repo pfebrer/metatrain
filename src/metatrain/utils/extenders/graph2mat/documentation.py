@@ -12,11 +12,11 @@ from typing_extensions import TypedDict
 
 class Hypers(TypedDict):
     """
-    Hyperparameters for the graph2mat hook.
+    Hyperparameters for the graph2mat extender.
     """
 
     outputs: Optional[str | list[str]] = None
-    """The names of the outputs to be produced by the hook."""
+    """The names of the outputs to be produced by the extender."""
 
     cutoff: float = 8.0
     """The cutoff distance for the neighbor list."""

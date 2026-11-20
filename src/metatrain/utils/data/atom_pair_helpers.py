@@ -184,7 +184,7 @@ def get_pair_target_neighborlist(
         return req_nls[0]
     else:
         nl = None
-        for hook in model.forward_hooks:
+        for hook in model.extenders:
             if any(
                 out.sample_kind == "atom_pair"
                 for out in hook.supported_outputs().values()
